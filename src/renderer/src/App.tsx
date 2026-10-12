@@ -4,7 +4,7 @@ import {
   PanelRightClose, PanelRightOpen, Plus, RotateCw, Terminal, Unplug, KeyRound,
 } from 'lucide-react';
 import type { PortForward, ServiceNode, SessionInfo, SyncConflict, Workspace } from '../../shared/types';
-import { connectionLabels, connectionTone, syncLabels, syncTone } from './format';
+import { connectionLabels, connectionTone, workspaceSyncLabel, workspaceSyncTone } from './format';
 import { useAppState } from './useAppState';
 import { NodeList } from './components/NodeList';
 import { TerminalView, type TerminalHandle } from './components/TerminalView';
@@ -169,7 +169,7 @@ export default function App() {
           <footer className="terminal-statusbar">
             <Status tone={connectionTone(state.connection.phase)} busy={connectionBusy}>{connectionLabels[state.connection.phase]}</Status>
             <span className="connection-message truncate" title={state.connection.message}>{state.connection.message}</span>
-            {workspace && <span className="footer-sync"><Status tone={syncTone(state.sync.phase)}>{syncLabels[state.sync.phase]}</Status></span>}
+            {workspace && <span className="footer-sync" title={state.sync.git?.message || state.sync.message}><Status tone={workspaceSyncTone(state.sync)} busy={state.sync.git?.phase==='syncing'}>{workspaceSyncLabel(state.sync)}</Status></span>}
             <div className="footer-tools"><IconButton icon={Copy} label="复制终端选区" onClick={() => { void terminalRef.current?.copy(); }} />
               <IconButton icon={ClipboardPaste} label="粘贴到终端" disabled={!connected} onClick={() => { void terminalRef.current?.paste(); }} /></div>
           </footer>

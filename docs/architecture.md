@@ -85,7 +85,9 @@ transport. Do not synchronize lock files, indexes, refs, or credential-bearing
 Git configuration bidirectionally. Use a single writer, pause synchronization
 around branch changes, and check local concurrent edits before updating the
 local baseline. Repositories with no commits and dirty worktrees need explicit
-acceptance coverage. Never automatically reset a user's local branch or files.
+acceptance coverage. Only fast-forward the local baseline, preserving unrelated
+staging and all working files. Back up the original index and report divergent
+histories or overlapping staged edits for review; never force-reset local work.
 
 Preflight checks cover case-only name collisions, symlinks outside the root,
 Windows symlink capabilities, executable bits, and files that fail to transfer.

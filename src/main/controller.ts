@@ -19,7 +19,7 @@ import { GitWorkspace } from './git';
 import { ProjectMemoryImporter } from './memory';
 import { ClipboardImageUploader, terminalPaste, type ClipboardContent } from './clipboard';
 import type { TerminalPasteRequest, TerminalPasteResult } from '../shared/types';
-import { emptySync, type AppState,type AppEvent,type ServiceNode,type SessionInfo,type Workspace,type ActivityEvent,type NodeInput,type ImportRequest,type PortForward,type ProviderInput } from '../shared/types';
+import { emptySync, type SyncState,type AppState,type AppEvent,type ServiceNode,type SessionInfo,type Workspace,type ActivityEvent,type NodeInput,type ImportRequest,type PortForward,type ProviderInput } from '../shared/types';
 
 const metricsSchema=z.object({hostname:z.string(),os:z.string(),cpuCount:z.number().int().min(1),load:z.number().min(0),memoryTotal:z.number().min(0),memoryAvailable:z.number().min(0),diskAvailable:z.number().min(0),uptime:z.number().min(0),claudeVersion:z.string().nullable(),authenticated:z.boolean(),address:z.string(),sampledAt:z.string()});
 interface ControllerOptions {
@@ -39,6 +39,9 @@ export class AppController {
   private imageUploader:ClipboardImageUploader;
   private clipboardPaste?:{generation:number};
   private git:GitWorkspace;
+  private gitSynchronization?:{generation:number;workspaceId:string;promise:Promise<void>};
+  private gitState?:{generation:number;workspaceId:string;state:NonNullable<SyncState['git']>};
+  private nextGitCheck=0;
   private state:AppState;
   private terminal:pty.IPty|undefined;
   private bridgePort=0;
@@ -63,13 +66,14 @@ export class AppController {
     const mutagenPath=process.env.HAPPYPANDA_MUTAGEN_PATH??[join(options.resourcesDir,'../tools',binary),join(options.resourcesDir,'../.local/tools',binary)].find(existsSync);
     const prepareSsh=async(node:ServiceNode)=>{await verifySystemIdentity(node,runCommand);return {target:node.sshTarget,user:node.user,port:node.port,mutagenSshPath:dirname(sshExecutable()),scpPath:scpExecutable()};};
     this.sync=new WorkspaceSync({dataDir:options.dataDir,runRemote,uploadFile,mutagenPath,prepareSsh,onWorkspaceUpdated:async()=>{await this.store.save();this.publish();},onState:state=>{
-      this.state.sync=state;
+      this.state.sync={...state,git:this.gitState?.generation===this.generation&&this.gitState.workspaceId===this.state.connection.activeWorkspaceId?this.gitState.state:undefined};
       const preparation=this.state.workspacePreparation;
       if(preparation&&['syncing','error'].includes(preparation.phase)&&this.workspaceSetup&&!this.workspaceSetup.failed){
         preparation.phase=['error','conflict','paused','disconnected'].includes(state.phase)?'error':'syncing';
         preparation.message=preparation.phase==='error'?state.message:'正在同步工作区；首次使用将在就绪后启动会话。';
       }
       this.publish();
+      if(state.phase==='ready')void this.syncGitCommits(false);
     },onActivity:event=>this.activity(event)});
     this.git=new GitWorkspace(options.dataDir);
     this.bridge=new LocalMcpBridge({token:options.token,dataDir:options.dataDir,
@@ -104,6 +108,7 @@ export class AppController {
     if(!['PostToolUse','UserPromptSubmit','Stop','SessionStart','Notification'].includes(event))return;
     this.activity({kind:'tool',title:event==='PostToolUse'?String(payload.tool??'Tool')+' completed':event==='UserPromptSubmit'?'Prompt submitted':event==='Stop'?'Claude turn completed':event,
       detail:typeof payload.path==='string'?payload.path:undefined,location:'remote',sessionId:String(payload.sessionId??''),workspaceId:typeof payload.workspaceId==='string'?payload.workspaceId:undefined});
+    if(['PostToolUse','Stop'].includes(event))this.nextGitCheck=0;
   }
   async saveNode(input:NodeInput){const node=await this.store.saveNode(input);this.publish();return node;}
   async saveProvider(input:ProviderInput){
@@ -218,6 +223,8 @@ export class AppController {
   private async attach(node:ServiceNode,workspace:Workspace|undefined,session:SessionInfo,waitForReady=false){
     if((this.loginContext&&this.loginContext.sessionId!==session.id)||(this.state.browserLogin?.nodeId&&this.state.browserLogin.nodeId!==node.id)||node.providerId){this.loginContext=undefined;this.loginBrowser.block();}
     const generation=++this.generation;this.workspaceSetup?.abort.abort();this.workspaceSetup=undefined;this.closeTerminal();
+    this.gitState=undefined;this.nextGitCheck=0;
+    this.state.sync={...this.state.sync,git:undefined};
     this.state.connection={phase:'preparing',message:'Preparing workspace',retryAttempt:0,activeNodeId:node.id,activeWorkspaceId:workspace?.id,activeSessionId:session.id};
     this.state.metrics=null;this.state.terminalBuffer='';this.state.workspacePreparation=workspace?{workspaceId:workspace.id,phase:'syncing',message:'正在同步工作区；首次使用将在就绪后启动会话。'}:undefined;this.publish();
     if(session.kind!=='login')node.lastSessionId=session.id;node.lastWorkspaceId=workspace?.id;session.lastActiveAt=new Date().toISOString();await this.store.save();
@@ -258,6 +265,7 @@ export class AppController {
         await runRemote(node,'python3 '+shellQuote(runtime.helperPath)+' workspace-ready '+shellQuote(runtime.configPath));
         if(!current())return;
         this.state.workspacePreparation={workspaceId:workspace.id,phase:'ready',message:'工作区已就绪'};this.publish();
+        void this.syncGitCommits(true);
       }catch(error){
         if(!current())return;
         task.failed=true;
@@ -330,7 +338,38 @@ export class AppController {
     }finally{if(this.clipboardPaste===operation)this.clipboardPaste=undefined;}
   }
   resizeTerminal(cols:number,rows:number){if(Number.isInteger(cols)&&Number.isInteger(rows)&&cols>=10&&cols<=500&&rows>=3&&rows<=300){this.terminalCols=cols;this.terminalRows=rows;this.terminal?.resize(cols,rows);}}
-  async disconnect(){++this.generation;this.workspaceSetup?.abort.abort();this.workspaceSetup=undefined;this.loginContext=undefined;this.loginBrowser.block();this.closeTerminal();this.state.connection={phase:'disconnected',message:'',retryAttempt:0};this.state.metrics=null;this.state.workspacePreparation=undefined;this.publish();await this.sync.pause();}
+  async disconnect(){++this.generation;this.gitState=undefined;this.nextGitCheck=0;this.state.sync={...this.state.sync,git:undefined};this.workspaceSetup?.abort.abort();this.workspaceSetup=undefined;this.loginContext=undefined;this.loginBrowser.block();this.closeTerminal();this.state.connection={phase:'disconnected',message:'',retryAttempt:0};this.state.metrics=null;this.state.workspacePreparation=undefined;this.publish();await this.sync.pause();}
+  private async syncGitCommits(force:boolean):Promise<void>{
+    const generation=this.generation,workspaceId=this.state.connection.activeWorkspaceId;
+    if(!workspaceId||this.state.connection.phase!=='connected'||this.state.sync.phase!=='ready'||this.state.workspacePreparation?.phase!=='ready')return;
+    if(this.gitSynchronization){
+      const running=this.gitSynchronization;await running.promise;
+      if(running.generation===generation&&running.workspaceId===workspaceId)return;
+      if(generation===this.generation)return this.syncGitCommits(force);
+      return;
+    }
+    if(!force&&Date.now()<this.nextGitCheck)return;
+    this.nextGitCheck=Date.now()+10000;
+    const workspace=this.store.workspace(workspaceId),node=this.store.node(workspace.nodeId);
+    const current=()=>generation===this.generation&&workspaceId===this.state.connection.activeWorkspaceId&&this.state.connection.phase==='connected'&&this.state.sync.phase==='ready'&&this.state.workspacePreparation?.phase==='ready';
+    const previous=this.gitState?.state;
+    const changed=(state:NonNullable<SyncState['git']>)=>{this.gitState={generation,workspaceId,state};this.state.sync={...this.state.sync,git:state};this.publish();};
+    changed({phase:'syncing',message:'Checking remote Git commits'});
+    const promise=(async()=>{
+      try{
+        const result=await this.git.syncRemoteCommits(workspace,node,current);
+        if(!current())return;
+        changed(result);
+        if(result.updated||(result.phase==='blocked'&&(previous?.phase!==result.phase||previous.message!==result.message)))this.activity({kind:'sync',title:result.updated?'Remote commits synchronized':'Remote commits need review',detail:result.message+(result.reference?'\n'+result.reference:''),workspaceId});
+      }catch(error){
+        if(!current())return;
+        const message=(error as Error).message;changed({phase:'error',message});
+        if(previous?.phase!=='error'||previous.message!==message)this.activity({kind:'error',title:'Remote commit synchronization failed',detail:message,workspaceId});
+      }
+    })();
+    this.gitSynchronization={generation,workspaceId,promise};
+    try{await promise;}finally{if(this.gitSynchronization?.promise===promise)this.gitSynchronization=undefined;}
+  }
   async syncNow(){
     const generation=this.generation;
     const workspace=this.state.connection.activeWorkspaceId?this.store.workspace(this.state.connection.activeWorkspaceId):undefined;
@@ -342,10 +381,10 @@ export class AppController {
       if(this.workspaceSetup?.failed)this.startWorkspaceSetup(node,workspace,this.workspaceSetup.runtime,this.generation);
       await this.workspaceSetup?.promise;
       if(this.state.connection.activeWorkspaceId===workspace.id&&this.state.workspacePreparation?.phase==='ready'){
-        const reference=await this.git.fetchRemoteCommits(workspace,node);if(reference)this.activity({kind:'sync',title:'Remote commits fetched',detail:reference,workspaceId:workspace.id});
+        await this.syncGitCommits(true);
       }
     }
-    return state;
+    return this.state.sync;
   }
   async pauseSync(){await this.sync.pause();}
   async resolveConflict(path:string,prefer:'local'|'remote'){if(!['local','remote'].includes(prefer))throw new Error('Invalid conflict preference');await this.sync.resolveConflict(path,prefer);}
@@ -374,5 +413,5 @@ export class AppController {
     const forward={id:randomUUID(),localPort,remotePort,nodeId:node.id};this.forwards.set(forward.id,{process:child,forward});child.once('exit',()=>{if(this.forwards.delete(forward.id))this.activity({kind:'connection',title:'Port forwarding closed',detail:'127.0.0.1:'+localPort});});this.publish();return forward;
   }
   async removePortForward(id:string){const entry=this.forwards.get(id);if(entry){this.forwards.delete(id);entry.process.kill();this.publish();}}
-  async dispose(){await this.disconnect();await this.loginBrowser.dispose();for(const entry of this.forwards.values())entry.process.kill();this.forwards.clear();await this.sync.dispose();await this.bridge.stop();await this.store.save();}
+  async dispose(){await this.disconnect();await this.gitSynchronization?.promise;await this.loginBrowser.dispose();for(const entry of this.forwards.values())entry.process.kill();this.forwards.clear();await this.sync.dispose();await this.bridge.stop();await this.store.save();}
 }

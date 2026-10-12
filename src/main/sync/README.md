@@ -15,7 +15,14 @@ path escaping avoids changing glob semantics, and tracked files remain eligible
 even under ignore rules. A changed scope pauses the previous session and creates
 a named replacement; it never resets or deletes session history or endpoint data.
 Git initialization
-and baseline/fetch operations belong to main's separate Git module.
+and baseline/fetch operations belong to main's separate Git module. The
+controller checks remote commits after readiness, periodically while files are
+ready, after remote tool completion, and on manual synchronization. Incremental
+bundles update a separate tracking ref; a fast-forward updates the current local
+branch and only index entries changed by the commit, without rewriting files.
+The original index is backed up. Divergence, active Git operations, busy indexes
+and overlapping staging that does not match the commit remain pending for review.
+`SyncState.git` reports these outcomes separately from file synchronization.
 
 `ensure` reuses sessions only when their name, endpoint orientation, paths,
 SSH settings, mode and exclusions match. Mismatches return an error state and

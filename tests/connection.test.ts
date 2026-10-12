@@ -5,19 +5,22 @@ import { basename,isAbsolute,join,relative,resolve } from 'node:path';
 import { createHash } from 'node:crypto';
 
 const mocks=vi.hoisted(()=>({terminals:[] as any[],spawn:vi.fn(),remote:vi.fn(),clipboard:vi.fn()}));
-const syncMocks=vi.hoisted(()=>({ensure:vi.fn(),wait:vi.fn(),flush:vi.fn()}));
+const syncMocks=vi.hoisted(()=>({ensure:vi.fn(),wait:vi.fn(),flush:vi.fn(),state:vi.fn()}));
+const gitMocks=vi.hoisted(()=>({sync:vi.fn()}));
 vi.mock('node-pty',()=>({spawn:mocks.spawn}));
 vi.mock('../src/main/ssh',async importOriginal=>{
   const actual=await importOriginal<typeof import('../src/main/ssh')>();
   return {...actual,runRemote:mocks.remote};
 });
 vi.mock('../src/main/sync',()=>({WorkspaceSync:class{
+  constructor(options:any){syncMocks.state.mockImplementation(options.onState);}
   pause=async()=>{};dispose=async()=>{};
   ensure=syncMocks.ensure;waitUntilReady=syncMocks.wait;flush=syncMocks.flush;
 }}));
-vi.mock('../src/main/git',()=>({GitWorkspace:class{bootstrap=async()=>false;}}));
+vi.mock('../src/main/git',()=>({GitWorkspace:class{bootstrap=async()=>false;syncRemoteCommits=gitMocks.sync;}}));
 import { AppController } from '../src/main/controller';
 import { TEST_NODE } from './fixtures/node';
+import { workspaceSyncLabel,workspaceSyncTone } from '../src/renderer/src/format';
 
 let controller:AppController|undefined;
 let directory:string;
@@ -25,7 +28,8 @@ beforeEach(async()=>{
   directory=await mkdtemp(join(tmpdir(),'hp-connection-'));
   mocks.terminals.length=0;mocks.spawn.mockReset();mocks.remote.mockReset();
   mocks.clipboard.mockReset().mockResolvedValue({kind:'empty'});
-  syncMocks.ensure.mockReset().mockResolvedValue({phase:'scanning',message:'Scanning',conflicts:[]});syncMocks.wait.mockReset();syncMocks.flush.mockReset();
+  syncMocks.ensure.mockReset().mockResolvedValue({phase:'scanning',message:'Scanning',conflicts:[]});syncMocks.wait.mockReset();syncMocks.flush.mockReset();syncMocks.state.mockReset();
+  gitMocks.sync.mockReset().mockResolvedValue({phase:'ready',message:'Git commits synchronized'});
   mocks.remote.mockResolvedValue(JSON.stringify({configPath:'/home/ubuntu/.local/share/happypanda/test/config.json',helperPath:'/home/ubuntu/.local/share/happypanda/hp_remote.py'}));
   mocks.spawn.mockImplementation(()=>{
     const terminal={write:vi.fn(),resize:vi.fn(),kill:vi.fn(),data:undefined as undefined|((data:string)=>void),exit:undefined as undefined|((value:{exitCode:number})=>void),onData:vi.fn(),onExit:vi.fn()};
@@ -234,6 +238,51 @@ describe('remote session recovery',()=>{
     await vi.advanceTimersByTimeAsync(40000);
     expect(controller!.snapshot().connection.phase).toBe('failed');
     expect(mocks.spawn).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('automatic Git commit synchronization',()=>{
+  const ready={phase:'ready',message:'Files synchronized',conflicts:[],sessionName:'hp-workspace',updatedAt:''};
+  async function connect(){
+    controller!.store.workspaces.push({id:'workspace',nodeId:'test-node',name:'project',localPath:directory,remotePath:'/srv/project',localAccess:false,syncSessionName:'hp-workspace',createdAt:''});
+    syncMocks.ensure.mockResolvedValue(ready);syncMocks.wait.mockResolvedValue(ready);syncMocks.flush.mockResolvedValue(ready);
+    await controller!.connect('test-node','workspace');mocks.terminals[0].data('\x1b]777;happypanda-ready\x07');
+    await vi.waitFor(()=>expect(controller!.snapshot().workspacePreparation?.phase).toBe('ready'));
+    syncMocks.state(ready);
+  }
+  it('checks ready workspaces automatically, throttles idle polls and checks commit-only changes again',async()=>{
+    await connect();await vi.waitFor(()=>expect(gitMocks.sync).toHaveBeenCalledTimes(1));
+    syncMocks.state(ready);await vi.advanceTimersByTimeAsync(1);expect(gitMocks.sync).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(10000);syncMocks.state(ready);
+    await vi.waitFor(()=>expect(gitMocks.sync).toHaveBeenCalledTimes(2));
+    expect(workspaceSyncLabel(controller!.snapshot().sync)).toBe('已同步');
+  });
+  it('checks after remote tool completion without waiting for the next idle interval',async()=>{
+    await connect();await vi.waitFor(()=>expect(gitMocks.sync).toHaveBeenCalledTimes(1));
+    (controller as any).remoteEvent({type:'tool',id:'commit-completed',nodeId:'test-node',sessionId:controller!.snapshot().connection.activeSessionId,event:'Stop'});
+    syncMocks.state(ready);await vi.waitFor(()=>expect(gitMocks.sync).toHaveBeenCalledTimes(2));
+  });
+  it('shows Git conflicts separately from completed file synchronization and supports an immediate retry',async()=>{
+    gitMocks.sync.mockResolvedValue({phase:'blocked',message:'Branches have diverged',reference:'refs/remotes/happypanda/workspace'});
+    await connect();await vi.waitFor(()=>expect(controller!.snapshot().sync.git?.phase).toBe('blocked'));
+    expect(controller!.snapshot().sync.phase).toBe('ready');expect(workspaceSyncLabel(controller!.snapshot().sync)).toBe('提交待处理');expect(workspaceSyncTone(controller!.snapshot().sync)).toBe('warning');
+    gitMocks.sync.mockResolvedValue({phase:'ready',updated:true,message:'Commits synchronized'});
+    expect((await controller!.syncNow()).git?.phase).toBe('ready');expect(gitMocks.sync).toHaveBeenCalledTimes(2);
+  });
+  it('reports transfer failures without labeling commits synchronized',async()=>{
+    gitMocks.sync.mockRejectedValue(new Error('SSH failed'));
+    await connect();await vi.waitFor(()=>expect(controller!.snapshot().sync.git?.phase).toBe('error'));
+    expect(workspaceSyncLabel(controller!.snapshot().sync)).toBe('提交同步失败');expect(workspaceSyncTone(controller!.snapshot().sync)).toBe('danger');
+    expect(controller!.snapshot().connection.phase).toBe('connected');
+  });
+  it('does not apply stale Git results after disconnecting and coalesces overlapping polls',async()=>{
+    let finish!:(result:any)=>void;gitMocks.sync.mockImplementation(()=>new Promise(resolve=>{finish=resolve;}));
+    await connect();await vi.waitFor(()=>expect(gitMocks.sync).toHaveBeenCalledTimes(1));
+    syncMocks.state(ready);syncMocks.state(ready);expect(gitMocks.sync).toHaveBeenCalledTimes(1);
+    const current=gitMocks.sync.mock.calls[0][2];expect(current()).toBe(true);
+    await controller!.disconnect();expect(current()).toBe(false);
+    finish({phase:'ready',updated:true,message:'Stale result'});await vi.advanceTimersByTimeAsync(1);
+    expect(controller!.snapshot().activities.some(event=>event.title==='Remote commits synchronized')).toBe(false);
   });
 });
 

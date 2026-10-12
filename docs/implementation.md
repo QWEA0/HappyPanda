@@ -261,8 +261,12 @@ comparison rules reduced the remote result to the identical 8-item list without
 changing files, refs or the index. A later live comparison showed identical
 10-item lists as work continued. Bootstrap now aligns filemode/autocrlf/eol for
 both new and existing mirrors. The remote `workspace` branch remains independent
-of the local branch; this does not synchronize staging state, branch switches,
-or commits automatically.
+of the local branch; staging and branch switches remain separate. Remote commits
+are now checked automatically once files are ready and transferred in incremental
+bundles. A fast-forward advances the current local branch and its committed index
+entries, preserving unrelated staging and working files. The original index is
+backed up; divergent histories or overlapping staged edits remain pending for
+review. Git failures have their own state and cannot appear as fully synchronized.
 
 The UI selects local session records and imports JSONL transcripts together
 with their subagent records. It returns remote paths for continuation in the

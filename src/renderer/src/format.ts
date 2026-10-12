@@ -1,4 +1,4 @@
-import type { ConnectionPhase, ServiceNode, SshAlias, SyncPhase } from '../../shared/types';
+import type { ConnectionPhase, ServiceNode, SshAlias, SyncPhase, SyncState } from '../../shared/types';
 
 export type Tone = 'neutral' | 'success' | 'warning' | 'danger';
 
@@ -22,6 +22,20 @@ export const syncLabels: Record<SyncPhase, string> = {
   disconnected: '同步已断开',
   error: '同步失败',
 };
+
+export function workspaceSyncLabel(state:SyncState|null):string {
+  if(!state)return syncLabels.none;
+  if(state.phase!=='ready')return syncLabels[state.phase];
+  if(!state.git)return '文件已同步';
+  return {syncing:'同步提交',ready:'已同步',blocked:'提交待处理',error:'提交同步失败'}[state.git.phase];
+}
+
+export function workspaceSyncTone(state:SyncState|null):Tone {
+  if(!state)return syncTone('none');
+  if(state.phase==='ready'&&state.git?.phase==='blocked')return 'warning';
+  if(state.phase==='ready'&&state.git?.phase==='error')return 'danger';
+  return syncTone(state.phase);
+}
 
 export function connectionTone(phase: ConnectionPhase): Tone {
   if (phase === 'connected') return 'success';

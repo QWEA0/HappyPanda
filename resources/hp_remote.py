@@ -217,7 +217,8 @@ def run_cli(config):
                    ". HappyPanda local MCP tools operate on workspace_id " + config["workspaceId"] +
                    " and the user's computer only when enabled. Use explicit local tools only for requested local operations. "
                    "Do not assume Windows command syntax works on this VPS. "
-                   "Working files synchronize in both directions, but Git metadata, branches and indexes remain separate. "
+                   "Working files synchronize in both directions. Git metadata is not file-synchronized; "
+                   "HappyPanda separately fetches remote commits and fast-forwards the local baseline when safe, preserving unrelated staging and working files. "
                    "The remote workspace branch is a baseline, not the local branch name. "
                    "Git operations that change working files also affect the mirrored local files. "
                    "Do not clean up apparent modifications, stage, commit, reset, checkout branches or push unless the user requested that Git action.")

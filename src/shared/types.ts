@@ -54,6 +54,7 @@ export interface ServerMetrics {
 export interface SyncConflict { path: string; description: string }
 export interface SyncState {
   phase: SyncPhase;
+  git?: {phase:'syncing'|'ready'|'blocked'|'error';message:string;head?:string;reference?:string};
   message: string;
   sessionName?: string;
   conflicts: SyncConflict[];

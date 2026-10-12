@@ -4,7 +4,7 @@ import {
   LogIn, MemoryStick, Pause, Play, RotateCw, Terminal, Wrench, X, BookOpen,
 } from 'lucide-react';
 import type { ActivityEvent, AppState, ServiceNode, SessionInfo, SshAlias, SyncConflict } from '../../../shared/types';
-import { connectionLabels, connectionTone, fileName, formatBytes, formatTime, formatUptime, nodeAddress, syncLabels, syncTone } from '../format';
+import { connectionLabels, connectionTone, fileName, formatBytes, formatTime, formatUptime, nodeAddress, workspaceSyncLabel, workspaceSyncTone } from '../format';
 import type { RunAction } from '../useAppState';
 import { IconButton, Status, useFocusScope } from './ui';
 import { ProviderPanel } from './ProviderDialogs';
@@ -117,12 +117,13 @@ export function Sidebar({ state, node, aliases, pending, run, narrow, modalOpen,
             <div className="local-access-row"><span>本机 MCP</span><button type="button" className="switch" role="switch" aria-label="本机 MCP" aria-checked={workspace.localAccess}
               title={workspace.localAccess ? '关闭本机 MCP' : '启用本机 MCP'} disabled={!connected || pending.has('local-access')}
               onClick={() => { void run('local-access', '设置本机 MCP', (api) => api.setLocalAccess(workspace.id, !workspace.localAccess)); }}><span /></button></div>
-            <div className="sync-heading"><Status tone={syncTone(sync?.phase || 'none')} busy={['preparing', 'scanning', 'syncing'].includes(sync?.phase || '')}>{syncLabels[sync?.phase || 'none']}</Status>
+            <div className="sync-heading"><Status tone={workspaceSyncTone(sync)} busy={['preparing', 'scanning', 'syncing'].includes(sync?.phase || '')||sync?.git?.phase==='syncing'}>{workspaceSyncLabel(sync)}</Status>
               <div className="section-tools"><IconButton icon={RotateCw} label="立即同步" disabled={!connected} busy={pending.has('sync-now')}
                 onClick={() => { void run('sync-now', '同步工作区', (api) => api.syncNow()); }} />
                 <IconButton icon={sync?.phase === 'paused' ? Play : Pause} label={sync?.phase === 'paused' ? '恢复同步' : '暂停同步'} disabled={!connected || !sync || sync.phase === 'none'} busy={pending.has('pause-sync')}
                   onClick={() => { if (sync?.phase === 'paused') void run('sync-now', '恢复同步', (api) => api.syncNow()); else void run('pause-sync', '暂停同步', (api) => api.pauseSync()); }} /></div></div>
             {sync?.message && <p className={`sync-message ${sync.phase === 'error' ? 'danger-text' : ''}`}>{sync.message}</p>}
+            {sync?.git && <p className={`sync-message ${sync.git.phase==='error'?'danger-text':sync.git.phase==='blocked'?'warning-text':''}`}>{sync.git.message}</p>}
             {sync?.bytesTransferred !== undefined && <p className="sample-time muted">已传输 {formatBytes(sync.bytesTransferred)}</p>}
             {sync?.updatedAt && <p className="sample-time muted" title={sync.updatedAt}>更新于 {formatTime(sync.updatedAt)}</p>}
             {Boolean(sync?.conflicts.length) && <ul className="conflict-list">{sync?.conflicts.map((conflict) => <li key={conflict.path}>
