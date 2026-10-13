@@ -52,7 +52,7 @@ interface JobOptions {
   dataDir: string;
   resolveCwd: (request: ExecRequest) => Promise<{ root: string; cwd: string }>;
   beforeOperation?: (workspaceId: string) => Promise<void>;
-  afterOperation?: (workspaceId: string) => Promise<void>;
+  afterOperation?: (workspaceId: string, info?: { mutates: boolean }) => Promise<void>;
   onActivity: (event: Omit<ActivityEvent, 'id' | 'time'>) => void;
 }
 const terminal = (record: Journal): boolean => record.status !== 'requested' && record.status !== 'running';

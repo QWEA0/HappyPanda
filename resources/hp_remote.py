@@ -87,12 +87,20 @@ def metrics(config, auth_cache):
             auth_cache["authenticated"] = False
             auth_cache["version"] = None
         auth_cache["time"] = time.time()
+    head = None
+    try:
+        probe = subprocess.run(["git", "-C", config["remotePath"], "rev-parse", "--verify", "HEAD"],
+                               capture_output=True, text=True, timeout=3)
+        if probe.returncode == 0:
+            head = probe.stdout.strip() or None
+    except (OSError, subprocess.TimeoutExpired):
+        pass
     return {"hostname": os.uname().nodename, "os": "Linux " + os.uname().release,
             "cpuCount": os.cpu_count() or 1, "load": os.getloadavg()[0],
             "memoryTotal": memory.get("MemTotal", 0), "memoryAvailable": memory.get("MemAvailable", 0),
             "diskAvailable": shutil.disk_usage(config["remotePath"]).free, "uptime": uptime,
             "claudeVersion": auth_cache.get("version"), "authenticated": auth_cache.get("authenticated", False),
-            "address": config.get("sshTarget", ""), "sampledAt": timestamp()}
+            "address": config.get("sshTarget", ""), "gitHead": head, "sampledAt": timestamp()}
 
 def record_hook(config):
     try:

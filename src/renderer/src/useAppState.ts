@@ -27,6 +27,9 @@ export function useAppState() {
   const revisionRef = useRef(0);
   const mountedRef = useRef(true);
   const noticeId = useRef(0);
+  // Main sends scrollback only via getState; between those, rebuild it from terminal events.
+  const bufferRef = useRef('');
+  const contextRef = useRef('');
 
   const notify = useCallback((kind: Notice['kind'], title: string, detail?: string) => {
     if (mountedRef.current) setNotice({ id: ++noticeId.current, kind, title, detail });
@@ -35,7 +38,11 @@ export function useAppState() {
   const refresh = useCallback(async (api: HappyPandaAPI) => {
     const revision = revisionRef.current;
     const next = await api.getState();
-    if (mountedRef.current && revision === revisionRef.current) setState(next);
+    if (mountedRef.current && revision === revisionRef.current) {
+      bufferRef.current = next.terminalBuffer;
+      contextRef.current = `${next.connection.activeNodeId || ''}/${next.connection.activeSessionId || ''}`;
+      setState(next);
+    }
   }, []);
 
   const run: RunAction = useCallback(async (key, title, action, options = {}) => {
@@ -80,9 +87,13 @@ export function useAppState() {
     try {
       unsubscribe = api.onEvent((event) => {
         if (!alive) return;
-        if (event.type === 'state') {
+        if (event.type === 'terminal') {
+          bufferRef.current = (bufferRef.current + event.data).slice(-512000);
+        } else if (event.type === 'state') {
           revisionRef.current += 1;
-          setState(event.state);
+          const context = `${event.state.connection.activeNodeId || ''}/${event.state.connection.activeSessionId || ''}`;
+          if (context !== contextRef.current) { contextRef.current = context; bufferRef.current = ''; }
+          setState({ ...event.state, terminalBuffer: bufferRef.current });
         } else if (event.type === 'activity') {
           setState((previous) => ({
             ...previous,

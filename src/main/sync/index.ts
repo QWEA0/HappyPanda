@@ -7,6 +7,7 @@ import { checkedLocalPath, conflictRelativePath, fileFingerprint, isWithin, same
 import { remoteFileOperation, type Fingerprint, type RunRemote } from './remote';
 import { JSON_TEMPLATE, normalizeMutagenState, parseMutagenSessions, type MutagenSession } from './state';
 import { gitIgnorePaths } from './git-ignores';
+import { timed } from '../perf';
 import { mutagenRemoteEndpoint, remoteRoot, runCommand, scpTransfer, sshAddress, verifySystemIdentity,
   type CommandRunner, type FileTransfer, type PrepareSsh, type SshPreparation } from './transport';
 
@@ -26,6 +27,8 @@ export interface WorkspaceSyncOptions {
   mutagenPath?: string;
   runCommand?: CommandRunner;
   pollIntervalMs?: number;
+  /** Longest time an already-prepared session may be reused without recomputing Git ignore scope. */
+  reuseMaxAgeMs?: number;
   onWorkspaceUpdated?: (workspace:Workspace)=>Promise<void>;
 }
 
@@ -87,6 +90,10 @@ export class WorkspaceSync {
   private disposing = false;
   private disposal?: Promise<void>;
   private started = false;
+  private ensuredAt = 0;
+  private lastActivity = 0;
+  private idleTicks = 0;
+  private queuedFlush?: Promise<SyncState>;
   private listeners=new Set<(state:SyncState)=>void>();
 
   constructor(options: WorkspaceSyncOptions) {
@@ -135,7 +142,7 @@ export class WorkspaceSync {
     const connection = prepared ?? this.active?.prepared;
     if (connection?.mutagenSshPath) Object.assign(env, { MUTAGEN_SSH_PATH: connection.mutagenSshPath });
     this.started = true;
-    return this.runner(this.binary, args, { env, timeoutMs: args[1] === 'flush' ? 120_000 : 60_000 });
+    return timed('mutagen ' + args.slice(0, 2).join(' '), () => this.runner(this.binary!, args, { env, timeoutMs: args[1] === 'flush' ? 120_000 : 60_000 }));
   }
 
   private async sessions(prepared?: SshPreparation): Promise<MutagenSession[]> {
@@ -153,17 +160,38 @@ export class WorkspaceSync {
 
   private startPolling(): void {
     if (this.timer || this.options.pollIntervalMs === 0) return;
+    const adaptive = this.options.pollIntervalMs === undefined;
     this.timer = setInterval(() => {
       if (this.polling || this.pending || this.disposed || this.disposing) return;
+      // Settled and untouched: poll every 5th tick (10s) instead of spawning mutagen every 2s.
+      if (adaptive && this.state.phase === 'ready' && Date.now() - this.lastActivity > 15_000 && ++this.idleTicks % 5 !== 0) return;
       this.polling = true;
       void this.status().catch(() => undefined).finally(() => { this.polling = false; });
     }, this.options.pollIntervalMs ?? 2000);
     this.timer.unref();
   }
 
-  ensure(workspace: Workspace, node: ServiceNode): Promise<SyncState> {
-    return this.serialize(async () => {
+  /** `reuse`: the session was prepared moments ago in this run; skip recomputing the Git ignore scope. */
+  ensure(workspace: Workspace, node: ServiceNode, options: { reuse?: boolean } = {}): Promise<SyncState> {
+    return this.serialize(() => timed('sync.ensure', async () => {
+      this.lastActivity = Date.now();
       try {
+        const active = this.active;
+        if (options.reuse && active && Date.now() - this.ensuredAt < (this.options.reuseMaxAgeMs ?? 10 * 60_000) &&
+          active.workspace.id === workspace.id && active.workspace.localPath === workspace.localPath &&
+          active.workspace.syncSessionName === workspace.syncSessionName && active.workspace.remotePath === workspace.remotePath &&
+          (['id', 'sshTarget', 'user', 'port', 'identityFile'] as const).every(key => active.node[key] === node[key])) {
+          try {
+            const session = (await this.sessions()).find(item => item.identifier === active.identifier);
+            if (session) {
+              assertReusableSession(session, active.localRoot, active.remotePath, active.connection, workspace.syncGitIgnores);
+              if (session.paused) await this.cli(['sync', 'resume', session.identifier]);
+              this.startPolling();
+              return await this.readStatus();
+            }
+          } catch { /* fall through to the full preparation */ }
+        }
+        this.ensuredAt = 0;
         if (workspace.nodeId !== node.id) throw new Error('Workspace belongs to a different service node');
         if (!path.isAbsolute(workspace.localPath)) throw new Error('Local workspace must be absolute');
         const remoteInput = workspace.remotePath.startsWith('$HOME/') ? `/home/${workspace.remotePath.slice(6)}` :
@@ -183,7 +211,7 @@ export class WorkspaceSync {
         if (matching.length > 1) throw new Error('Multiple Mutagen sessions use this name; explicit cleanup is required');
         let session:MutagenSession|undefined = matching[0];
         if (session) assertReusableSession(session, localRoot, remotePath, connection, workspace.syncGitIgnores);
-        const gitIgnores=await gitIgnorePaths(localRoot,this.runner,SYNC_IGNORES);
+        const gitIgnores=await timed('gitIgnorePaths',()=>gitIgnorePaths(localRoot,this.runner,SYNC_IGNORES));
         const previousGenerated=new Set(workspace.syncGitIgnores??[]);
         const preserved=(session?.ignore?.paths??[]).filter(value=>!previousGenerated.has(value));
         const ignores=orderedSyncIgnores([...preserved,...gitIgnores]);
@@ -210,7 +238,9 @@ export class WorkspaceSync {
           session=sessions.find(item=>item.name===selectedName);
           if(session){assertReusableSession(session,localRoot,remotePath,connection,gitIgnores);if(JSON.stringify(session.ignore?.paths)!==JSON.stringify(ignores))throw new Error('Existing scoped session has different ignore rules; it was preserved');}
         }
-        if (this.active && this.active.identifier !== session?.identifier) await this.cli(['sync', 'pause', this.active.identifier]);
+        // Pausing the previous workspace is independent of resuming this one; overlap the two Mutagen round trips.
+        const pausePrevious = this.active && this.active.identifier !== session?.identifier ? this.cli(['sync', 'pause', this.active.identifier]) : undefined;
+        pausePrevious?.catch(() => undefined);
         this.publish({ phase: 'preparing', message: 'Preparing workspace synchronization', conflicts: [], sessionName: selectedName, updatedAt: new Date().toISOString() });
         if (!session) {
           // A tracked tree can have thousands of exceptions, exceeding Windows argv limits.
@@ -226,12 +256,13 @@ export class WorkspaceSync {
         }
         workspace.syncSessionName=selectedName;workspace.syncGitIgnores=gitIgnores;
         await this.options.onWorkspaceUpdated?.(workspace);
+        this.ensuredAt = Date.now();
         this.active = { workspace: { ...workspace }, node: { ...node }, localRoot, remotePath, connection, prepared, identifier: session.identifier };
-        if (session.paused) await this.cli(['sync', 'resume', session.identifier]);
+        await Promise.all([pausePrevious, session.paused ? this.cli(['sync', 'resume', session.identifier]) : undefined]);
         this.startPolling();
         return await this.readStatus();
       } catch (error) { return this.failed(error); }
-    });
+    }));
   }
 
   status(): Promise<SyncState> {
@@ -249,7 +280,12 @@ export class WorkspaceSync {
   }
 
   flush(): Promise<SyncState> {
-    return this.serialize(async () => {
+    // Callers arriving before a queued flush starts share it; once it starts, a new
+    // caller gets its own flush because files may have changed after the scan began.
+    if (this.queuedFlush) return this.queuedFlush;
+    const result = this.serialize(async () => {
+      this.queuedFlush = undefined;
+      this.lastActivity = Date.now();
       try {
         if (!this.active) return this.publish(emptySync());
         const state = await this.readStatus();
@@ -258,6 +294,8 @@ export class WorkspaceSync {
         return await this.readStatus();
       } catch (error) { return this.failed(error); }
     });
+    this.queuedFlush = result;
+    return result;
   }
 
   pause(): Promise<void> {

@@ -166,6 +166,26 @@ describe('sync args, isolation and session ownership', () => {
     f.session.ignore = { paths: ['dist'] };
     expect((await f.sync.ensure(f.workspace, node)).message).toContain('required safe mode');
   });
+  it('reuses a prepared session without recomputing remote setup or Git scope', async () => {
+    const f = await fixture();
+    expect((await f.sync.ensure(f.workspace, node)).phase).toBe('ready');
+    const remoteCalls = f.runRemote.mock.calls.length;
+    const gitCalls = f.commands.filter(command => command.file === 'git').length;
+    expect((await f.sync.ensure(f.workspace, node, { reuse: true })).phase).toBe('ready');
+    expect(f.runRemote.mock.calls.length).toBe(remoteCalls);
+    expect(f.commands.filter(command => command.file === 'git').length).toBe(gitCalls);
+    await f.sync.ensure(f.workspace, node);
+    expect(f.runRemote.mock.calls.length).toBeGreaterThan(remoteCalls);
+  });
+  it('shares one flush between callers that arrive before it starts', async () => {
+    const f = await fixture();
+    await f.sync.ensure(f.workspace, node);
+    const before = f.commands.filter(command => command.args[1] === 'flush').length;
+    await Promise.all([f.sync.flush(), f.sync.flush(), f.sync.flush()]);
+    expect(f.commands.filter(command => command.args[1] === 'flush').length - before).toBe(1);
+    await f.sync.flush();
+    expect(f.commands.filter(command => command.args[1] === 'flush').length - before).toBe(2);
+  });
   it('reports an unsupported explicit identity rather than ignoring it', async () => {
     const f = await fixture();
     const state = await f.sync.ensure(f.workspace, { ...node, identityFile: path.join(f.directory, 'unconfigured key') });

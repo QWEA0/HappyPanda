@@ -49,6 +49,7 @@ export interface ServerMetrics {
   claudeVersion: string | null;
   authenticated: boolean;
   address: string;
+  gitHead?: string | null;
   sampledAt: string;
 }
 export interface SyncConflict { path: string; description: string }
@@ -168,6 +169,7 @@ export interface HappyPandaAPI {
   connect(nodeId: string, workspaceId?: string, sessionId?: string): Promise<void>;
   disconnect(): Promise<void>;
   newSession(kind?: 'claude' | 'login' | 'shell'): Promise<void>;
+  removeSession(id: string): Promise<void>;
   writeTerminal(data: string): void;
   pasteClipboard(request:TerminalPasteRequest):Promise<TerminalPasteResult>;
   resizeTerminal(cols: number, rows: number): void;

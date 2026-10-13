@@ -1,7 +1,7 @@
 import { useRef, useState, type CSSProperties } from 'react';
 import {
   Activity, AlertTriangle, Clock3, Cpu, ExternalLink, FolderOpen, GitCompare, HardDrive,
-  LogIn, MemoryStick, Pause, Play, RotateCw, Terminal, Wrench, X, BookOpen,
+  LogIn, MemoryStick, Pause, Play, RotateCw, Terminal, Trash2, Wrench, X, BookOpen,
 } from 'lucide-react';
 import type { ActivityEvent, AppState, ServiceNode, SessionInfo, SshAlias, SyncConflict } from '../../../shared/types';
 import { connectionLabels, connectionTone, fileName, formatBytes, formatTime, formatUptime, nodeAddress, workspaceSyncLabel, workspaceSyncTone } from '../format';
@@ -132,13 +132,17 @@ export function Sidebar({ state, node, aliases, pending, run, narrow, modalOpen,
           </> : <p className="empty-inline">尚未选择工作区</p>}
         </section>
         <section className="sidebar-section sessions-section"><div className="section-heading"><h2>最近会话</h2><span className="muted">{sessions.length}</span></div>
-          {sessions.length ? <ul className="session-list">{sessions.map((session) => <li key={session.id}>
+          {sessions.length ? <ul className="session-list">{sessions.map((session) => <li key={session.id} className="session-item">
             <button className={`session-option ${session.id === state.connection.activeSessionId ? 'is-current' : ''}`} onClick={() => onResume(session)} disabled={pending.has('connect') || pending.has('new-session') || pending.has('select-provider')}
               aria-current={session.id === state.connection.activeSessionId ? 'true' : undefined} title={`续接 ${session.title || session.id}`}>
               {session.kind === 'login' ? <LogIn size={14} aria-hidden="true" /> : <Terminal size={14} aria-hidden="true" />}
               <span className="option-text"><strong>{session.title || '未命名会话'}</strong><span className="muted">{formatTime(session.lastActiveAt, true)}{session.kind === 'login' ? ' · 登录' : session.kind === 'shell' ? ' · Shell' : ''}</span></span>
               {session.id === state.connection.activeSessionId && <span className="current-session-dot" aria-label="当前会话" />}
-            </button></li>)}</ul> : <p className="empty-inline">暂无会话</p>}
+            </button>
+            {session.id !== state.connection.activeSessionId && <IconButton icon={Trash2} label="删除会话" tooltip="删除会话并结束服务器上的 tmux 会话" className="session-remove"
+              busy={pending.has('remove-session-' + session.id)}
+              onClick={() => { void run('remove-session-' + session.id, '删除会话', (api) => api.removeSession(session.id)); }} />}
+          </li>)}</ul> : <p className="empty-inline">暂无会话</p>}
         </section>
         <section className="sidebar-section activity-section"><div className="section-heading"><h2>活动</h2></div>
           {activities.length ? <ul className="activity-list">{activities.map((event) => <ActivityRow event={event} key={event.id} />)}</ul> : <p className="empty-inline">暂无活动记录</p>}

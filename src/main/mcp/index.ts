@@ -15,7 +15,7 @@ export interface LocalMcpBridgeOptions {
   resolveWorkspace: (id: string) => Workspace | undefined;
   onActivity: (event: Omit<ActivityEvent, 'id' | 'time'>) => void;
   beforeOperation?: (workspaceId: string) => Promise<void>;
-  afterOperation?: (workspaceId: string) => Promise<void>;
+  afterOperation?: (workspaceId: string, info?: { mutates: boolean }) => Promise<void>;
   defaultWorkspaceId?: () => string | undefined;
   onRemoteEvent?: (payload: Record<string, unknown>) => void;
   statefulTransport?: boolean;
@@ -193,14 +193,14 @@ export class LocalMcpBridge {
     return workspace;
   }
 
-  private async fileOperation(workspace: Workspace, operation: (current: Workspace) => Promise<Record<string, unknown>>): Promise<Record<string, unknown>> {
+  private async fileOperation(workspace: Workspace, operation: (current: Workspace) => Promise<Record<string, unknown>>, mutates = true): Promise<Record<string, unknown>> {
     const prior = this.workspaceQueues.get(workspace.id) ?? Promise.resolve();
     const pending = prior.catch(() => undefined).then(async () => {
       const before = this.workspace(workspace.id);
       try { await this.options.beforeOperation?.(before.id); }
       catch (error) { throw new LocalToolError('BEFORE_OPERATION_FAILED', error instanceof Error ? error.message : 'Before-operation synchronization failed.'); }
       const data = await operation(this.workspace(workspace.id));
-      try { await this.options.afterOperation?.(workspace.id); }
+      try { await this.options.afterOperation?.(workspace.id, { mutates }); }
       catch (error) { throw new LocalToolError('AFTER_OPERATION_FAILED', error instanceof Error ? error.message : 'After-operation synchronization failed.', { operation_completed: true, result: data }); }
       return data;
     });
@@ -226,8 +226,8 @@ export class LocalMcpBridge {
   private async createSession(): Promise<Session> {
     const server = new McpServer({ name: 'happypanda-local', version: '0.1.0' });
     const readOnly = { readOnlyHint: true, destructiveHint: false, openWorldHint: false };
-    server.registerTool('local_list_files', { description: 'List canonical workspace entries. Recursive listings never follow symbolic links.', inputSchema: { ...workspaceShape, path: z.string().min(1).max(4096).default('.'), recursive: z.boolean().default(false), limit: z.number().int().min(1).max(5000).default(1000) }, annotations: readOnly }, args => this.tool('local_list_files', args, workspace => this.fileOperation(workspace, current => listLocalFiles(current.localPath, args.path, args.recursive, args.limit))));
-    server.registerTool('local_read_file', { description: 'Read a UTF-8 workspace file with a SHA-256 hash for optimistic writes.', inputSchema: { ...workspaceShape, path: z.string().min(1).max(4096) }, annotations: readOnly }, args => this.tool('local_read_file', args, workspace => this.fileOperation(workspace, current => readLocalFile(current.localPath, args.path))));
+    server.registerTool('local_list_files', { description: 'List canonical workspace entries. Recursive listings never follow symbolic links.', inputSchema: { ...workspaceShape, path: z.string().min(1).max(4096).default('.'), recursive: z.boolean().default(false), limit: z.number().int().min(1).max(5000).default(1000) }, annotations: readOnly }, args => this.tool('local_list_files', args, workspace => this.fileOperation(workspace, current => listLocalFiles(current.localPath, args.path, args.recursive, args.limit), false)));
+    server.registerTool('local_read_file', { description: 'Read a UTF-8 workspace file with a SHA-256 hash for optimistic writes.', inputSchema: { ...workspaceShape, path: z.string().min(1).max(4096) }, annotations: readOnly }, args => this.tool('local_read_file', args, workspace => this.fileOperation(workspace, current => readLocalFile(current.localPath, args.path), false)));
     server.registerTool('local_write_file', { description: 'Atomically replace a UTF-8 workspace file. expected_hash must match its SHA-256; null means create only. Parent directories must exist.', inputSchema: { ...workspaceShape, path: z.string().min(1).max(4096), content: z.string().max(MAX_FILE_BYTES), expected_hash: z.string().regex(/^[a-f0-9]{64}$/).nullable().optional() }, annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false } }, args => this.tool('local_write_file', args, workspace => this.fileOperation(workspace, current => writeLocalFile(current.localPath, args.path, args.content, args.expected_hash))));
     server.registerTool('local_exec', { description: 'Run an unchanged command in the local environment and return a persistent job ID for polling. Reuse op_id on retries; a different request with the same ID is rejected. Windows: powershell/pwsh. Unix: bash/sh. profile=no-profile suppresses shell startup files; default enables them. HTTP disconnect/cancellation never replays a job.', inputSchema: { ...execRequestSchema.omit({ workspace_id: true }).shape, ...workspaceShape }, annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true } }, args => this.tool('local_exec', args, workspace => this.jobs.execute(execRequestSchema.parse({ ...args, workspace_id: workspace.id }))));
     server.registerTool('local_job_status', { description: 'Get a job receipt including its actual exit code, synchronization errors and cancellation limits. unknown jobs are never rerun.', inputSchema: jobShape, annotations: readOnly }, args => this.tool('local_job_status', args, async workspace => this.jobs.status(workspace.id, args.job_id)));

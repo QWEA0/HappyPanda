@@ -73,3 +73,13 @@ macOS/Linux tar.gz assets by architecture and verifies the published SHA-256
 when supplied. It aborts on checksum mismatch or unavailable published sums;
 if a release publishes no digest at all, its JSON result explicitly reports
 `verified: false` and a warning.
+
+## Performance behavior
+
+- `ensure(workspace, node, { reuse: true })` reuses a session prepared earlier in
+  the same run (up to `reuseMaxAgeMs`, default 10 minutes) after verifying it still
+  exists and matches; it skips the remote setup call and Git ignore recomputation.
+  Manual synchronization calls `ensure` without `reuse` and refreshes the scope.
+- Status polling runs every 2 s while not ready or recently active, then every 10 s.
+- Concurrent `flush()` callers that arrive before a flush starts share it.
+- Set `HAPPYPANDA_PERF=1` to log durations of SSH, Mutagen and `ensure` calls.

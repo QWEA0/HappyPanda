@@ -59,7 +59,7 @@ async function start(){
   const handlers:Record<string,(...args:any[])=>unknown>={
     getState:()=>controller!.snapshot(),listSshAliases:()=>controller!.listAliases(),saveNode:input=>controller!.saveNode(input),removeNode:id=>controller!.removeNode(id),
     saveProvider:input=>controller!.saveProvider(input),removeProvider:id=>controller!.removeProvider(id),selectProvider:(nodeId,providerId)=>controller!.selectProvider(nodeId,providerId),
-    chooseWorkspace:id=>controller!.chooseWorkspace(id),connect:(...args)=>controller!.connect(args[0],args[1],args[2]),disconnect:()=>controller!.disconnect(),newSession:kind=>controller!.newSession(kind),
+    chooseWorkspace:id=>controller!.chooseWorkspace(id),connect:(...args)=>controller!.connect(args[0],args[1],args[2]),disconnect:()=>controller!.disconnect(),newSession:kind=>controller!.newSession(kind),removeSession:id=>controller!.removeSession(id),
     setLocalAccess:(id,enabled)=>{if(typeof enabled!=='boolean')throw new Error('Invalid local access setting');return controller!.setLocalAccess(id,enabled);},
     syncNow:()=>controller!.syncNow(),pauseSync:()=>controller!.pauseSync(),resolveConflict:(path,prefer)=>controller!.resolveConflict(path,prefer),
     pasteClipboard:request=>controller!.pasteClipboard(request),

@@ -43,6 +43,7 @@ export class InventoryStore {
     }
   }
   save(): Promise<void> {
+    if (this.deferred) { clearTimeout(this.deferred); this.deferred = undefined; }
     const snapshot = JSON.stringify({ nodes:this.nodes, workspaces:this.workspaces, sessions:this.sessions }, null, 2);
     this.writes = this.writes.catch(() => {}).then(async () => {
       const target = join(this.dataDir,'inventory.json');
@@ -51,6 +52,13 @@ export class InventoryStore {
       await rename(temporary,target);
     });
     return this.writes;
+  }
+  // For frequent, low-value updates (lastActiveAt, lastSessionId): coalesce writes.
+  private deferred?: ReturnType<typeof setTimeout>;
+  saveSoon(delayMs = 1000): void {
+    if (this.deferred) return;
+    this.deferred = setTimeout(() => { this.deferred = undefined; void this.save().catch(() => {}); }, delayMs);
+    this.deferred.unref?.();
   }
   async saveNode(input: NodeInput) {
     const valid = nodeInputSchema.parse(input);

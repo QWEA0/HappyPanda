@@ -10,7 +10,7 @@ import { InventoryStore } from './store';
 import { ProviderStore, type SecretEncryption } from './providers';
 import { BrowserLoginManager, isAuthorizationLink } from './login-browser';
 import type { LoginNetworkCheck } from './login-network';
-import { sshArgs,runRemote,uploadFile,remoteHome,shellQuote,listSshAliases,sshExecutable,scpExecutable } from './ssh';
+import { sshArgs,runRemote,uploadFile,remoteHome,shellQuote,listSshAliases,sshExecutable,scpExecutable,closeSshChannels } from './ssh';
 import { verifySystemIdentity,runCommand } from './sync/transport';
 import { LocalMcpBridge,remoteBridgePort } from './mcp';
 import { WorkspaceSync } from './sync';
@@ -21,7 +21,7 @@ import { ClipboardImageUploader, terminalPaste, type ClipboardContent } from './
 import type { TerminalPasteRequest, TerminalPasteResult } from '../shared/types';
 import { emptySync, type SyncState,type AppState,type AppEvent,type ServiceNode,type SessionInfo,type Workspace,type ActivityEvent,type NodeInput,type ImportRequest,type PortForward,type ProviderInput } from '../shared/types';
 
-const metricsSchema=z.object({hostname:z.string(),os:z.string(),cpuCount:z.number().int().min(1),load:z.number().min(0),memoryTotal:z.number().min(0),memoryAvailable:z.number().min(0),diskAvailable:z.number().min(0),uptime:z.number().min(0),claudeVersion:z.string().nullable(),authenticated:z.boolean(),address:z.string(),sampledAt:z.string()});
+const metricsSchema=z.object({hostname:z.string(),os:z.string(),cpuCount:z.number().int().min(1),load:z.number().min(0),memoryTotal:z.number().min(0),memoryAvailable:z.number().min(0),diskAvailable:z.number().min(0),uptime:z.number().min(0),claudeVersion:z.string().nullable(),authenticated:z.boolean(),address:z.string(),gitHead:z.string().regex(/^[a-f0-9]{40,64}$/).nullable().optional(),sampledAt:z.string()});
 interface ControllerOptions {
   dataDir:string;resourcesDir:string;token:string;emit:(event:AppEvent)=>void;
   encryption?:SecretEncryption;
@@ -42,6 +42,10 @@ export class AppController {
   private gitSynchronization?:{generation:number;workspaceId:string;promise:Promise<void>};
   private gitState?:{generation:number;workspaceId:string;state:NonNullable<SyncState['git']>};
   private nextGitCheck=0;
+  private lastGitCheck=0;
+  private knownRemoteHead:string|null|undefined;
+  private lastPublish=0;
+  private publishTimer:ReturnType<typeof setTimeout>|undefined;
   private state:AppState;
   private terminal:pty.IPty|undefined;
   private bridgePort=0;
@@ -66,32 +70,43 @@ export class AppController {
     const mutagenPath=process.env.HAPPYPANDA_MUTAGEN_PATH??[join(options.resourcesDir,'../tools',binary),join(options.resourcesDir,'../.local/tools',binary)].find(existsSync);
     const prepareSsh=async(node:ServiceNode)=>{await verifySystemIdentity(node,runCommand);return {target:node.sshTarget,user:node.user,port:node.port,mutagenSshPath:dirname(sshExecutable()),scpPath:scpExecutable()};};
     this.sync=new WorkspaceSync({dataDir:options.dataDir,runRemote,uploadFile,mutagenPath,prepareSsh,onWorkspaceUpdated:async()=>{await this.store.save();this.publish();},onState:state=>{
+      const previous=JSON.stringify([{...this.state.sync,updatedAt:''},this.state.workspacePreparation]);
       this.state.sync={...state,git:this.gitState?.generation===this.generation&&this.gitState.workspaceId===this.state.connection.activeWorkspaceId?this.gitState.state:undefined};
       const preparation=this.state.workspacePreparation;
       if(preparation&&['syncing','error'].includes(preparation.phase)&&this.workspaceSetup&&!this.workspaceSetup.failed){
         preparation.phase=['error','conflict','paused','disconnected'].includes(state.phase)?'error':'syncing';
         preparation.message=preparation.phase==='error'?state.message:'正在同步工作区；首次使用将在就绪后启动会话。';
       }
-      this.publish();
-      if(state.phase==='ready')void this.syncGitCommits(false);
+      // Status polling reports an unchanged state every few seconds; don't re-render for it.
+      if(JSON.stringify([{...this.state.sync,updatedAt:''},this.state.workspacePreparation])!==previous)this.publish();
+      // Remote HEAD arrives with server metrics, so SSH is only needed when it changed,
+      // after a tool that can commit, or as a slow safety net.
+      if(state.phase==='ready'&&(this.nextGitCheck===0||Date.now()-this.lastGitCheck>60000))void this.syncGitCommits(false);
     },onActivity:event=>this.activity(event)});
     this.git=new GitWorkspace(options.dataDir);
     this.bridge=new LocalMcpBridge({token:options.token,dataDir:options.dataDir,
       resolveWorkspace:id=>this.store.workspaces.find(workspace=>workspace.id===id&&this.state.connection.activeWorkspaceId===id),
       onActivity:event=>this.activity(event),onRemoteEvent:payload=>this.remoteEvent(payload),
       beforeOperation:async id=>{if(id!==this.state.connection.activeWorkspaceId)throw new Error('Workspace is not connected');if(this.state.workspacePreparation?.workspaceId===id&&this.state.workspacePreparation.phase!=='ready')throw new Error('工作区尚未准备完成，请等待同步或处理同步错误。');if(this.state.sync.phase!=='none'){const sync=await this.sync.flush();if(sync.phase!=='ready')throw new Error('Workspace synchronization is not ready');}},
-      afterOperation:async id=>{if(id!==this.state.connection.activeWorkspaceId)throw new Error('Command finished in an inactive workspace; synchronize that workspace before using its artifacts');if(this.state.sync.phase!=='none'){const sync=await this.sync.flush();if(sync.phase!=='ready')throw new Error('Command finished; resulting files are awaiting synchronization');}},
+      afterOperation:async (id,info)=>{if(id!==this.state.connection.activeWorkspaceId)throw new Error('Command finished in an inactive workspace; synchronize that workspace before using its artifacts');if(info?.mutates===false)return;if(this.state.sync.phase!=='none'){const sync=await this.sync.flush();if(sync.phase!=='ready')throw new Error('Command finished; resulting files are awaiting synchronization');}},
     });
     this.importer=new HistoryImporter({dataDir:options.dataDir,runRemote,uploadFile});
     this.imageUploader=new ClipboardImageUploader(options.resourcesDir);
   }
   async initialize(){await this.store.load();await this.providers.load();const bridge=await this.bridge.start();this.bridgePort=bridge.port;this.publish();}
-  snapshot():AppState {return structuredClone({...this.state,nodes:this.store.nodes,providers:this.providers.list(),workspaces:this.store.workspaces,sessions:this.store.sessions,portForwards:[...this.forwards.values()].map(entry=>entry.forward)});}
-  private publish(){this.options.emit({type:'state',state:this.snapshot()});}
+  snapshot(includeTerminal=true):AppState {return structuredClone({...this.state,terminalBuffer:includeTerminal?this.state.terminalBuffer:'',nodes:this.store.nodes,providers:this.providers.list(),workspaces:this.store.workspaces,sessions:this.store.sessions,portForwards:[...this.forwards.values()].map(entry=>entry.forward)});}
+  // State events omit the (up to 512 KB) terminal scrollback: output already streams
+  // as 'terminal' events and the renderer keeps its own copy; getState returns it whole.
+  private publish(){
+    const wait=this.lastPublish+40-Date.now();
+    if(wait>0){this.publishTimer??=setTimeout(()=>{this.publishTimer=undefined;this.publish();},wait);return;}
+    this.lastPublish=Date.now();
+    this.options.emit({type:'state',state:this.snapshot(false)});
+  }
   private activity(input:Omit<ActivityEvent,'id'|'time'>){
     const activity:ActivityEvent={...input,id:randomUUID(),time:new Date().toISOString()};
     this.state.activities=[activity,...this.state.activities].slice(0,150);
-    this.options.emit({type:'activity',activity});this.publish();
+    this.options.emit({type:'activity',activity});
   }
   private remoteEvent(payload:Record<string,unknown>){
     if(payload.nodeId!==this.state.connection.activeNodeId)return;
@@ -101,14 +116,19 @@ export class AppController {
       void this.openLoginLink(payload.url).catch(()=>{if(this.loginContext===context)context.hookOpened=false;this.activity({kind:'error',title:'登录浏览器未能打开，请点击终端中的授权链接或重新登录。'});});return;
     }
     if(payload.type==='login-result'){void this.completeLogin(payload).catch(()=>this.activity({kind:'error',title:'登录完成后的会话恢复失败，请重新连接。'}));return;}
-    if(payload.type==='metrics'&&payload.sessionId===this.state.connection.activeSessionId){const metrics=metricsSchema.safeParse(payload.metrics);if(metrics.success){this.state.metrics=metrics.data;this.publish();}return;}
+    if(payload.type==='metrics'&&payload.sessionId===this.state.connection.activeSessionId){const metrics=metricsSchema.safeParse(payload.metrics);if(metrics.success){
+      this.state.metrics=metrics.data;
+      const head=metrics.data.gitHead;
+      if(head&&head!==this.knownRemoteHead){this.knownRemoteHead=head;this.nextGitCheck=0;void this.syncGitCommits(false);}
+      this.publish();
+    }return;}
     if(payload.type!=='tool'||typeof payload.id!=='string'||this.seenEvents.has(payload.id))return;
     this.seenEvents.add(payload.id);if(this.seenEvents.size>2000)this.seenEvents.delete(this.seenEvents.values().next().value!);
     const event=String(payload.event??'');
     if(!['PostToolUse','UserPromptSubmit','Stop','SessionStart','Notification'].includes(event))return;
     this.activity({kind:'tool',title:event==='PostToolUse'?String(payload.tool??'Tool')+' completed':event==='UserPromptSubmit'?'Prompt submitted':event==='Stop'?'Claude turn completed':event,
       detail:typeof payload.path==='string'?payload.path:undefined,location:'remote',sessionId:String(payload.sessionId??''),workspaceId:typeof payload.workspaceId==='string'?payload.workspaceId:undefined});
-    if(['PostToolUse','Stop'].includes(event))this.nextGitCheck=0;
+    if(event==='Stop'||(event==='PostToolUse'&&payload.tool==='Bash')){this.nextGitCheck=0;void this.syncGitCommits(false);}
   }
   async saveNode(input:NodeInput){const node=await this.store.saveNode(input);this.publish();return node;}
   async saveProvider(input:ProviderInput){
@@ -159,6 +179,18 @@ export class AppController {
   async setLocalAccess(workspaceId:string,enabled:boolean){const workspace=this.store.workspace(workspaceId);workspace.localAccess=enabled;await this.store.save();this.activity({kind:'connection',title:enabled?'Local MCP access enabled':'Local MCP access disabled',workspaceId,location:'local'});}
   private createSession(node:ServiceNode,workspace:Workspace|undefined,kind:SessionInfo['kind']='claude',transcriptPath?:string){
     const id=randomUUID();const now=new Date().toISOString();const session:SessionInfo={id,nodeId:node.id,workspaceId:workspace?.id,title:kind==='login'?'Account login':kind==='shell'?'Remote shell':workspace?.name??'Claude Code',tmuxName:'hp-'+id.replaceAll('-',''),createdAt:now,lastActiveAt:now,kind,transcriptPath};this.store.sessions.unshift(session);return session;
+  }
+  /** Forget a session and end its tmux session on the server (best effort). */
+  async removeSession(id:string){
+    if(typeof id!=='string')throw new Error('Invalid session');
+    const session=this.store.sessions.find(item=>item.id===id);
+    if(!session)throw new Error('Session not found');
+    if(this.state.connection.activeSessionId===id&&this.state.connection.phase!=='disconnected')throw new Error('请先切换到其他会话，再删除当前会话。');
+    const node=this.store.nodes.find(item=>item.id===session.nodeId);
+    this.store.sessions=this.store.sessions.filter(item=>item.id!==id);
+    if(node?.lastSessionId===id)node.lastSessionId=undefined;
+    await this.store.save();this.publish();
+    if(node&&/^hp-[a-f0-9]+$/.test(session.tmuxName))await runRemote(node,'tmux -L happypanda kill-session -t '+shellQuote(session.tmuxName)+' 2>/dev/null; true').catch(()=>undefined);
   }
   async connect(nodeId:string,workspaceId?:string,sessionId?:string){
     if(this.switchingProvider)throw new Error('正在更新提供商，请稍后再连接。');
@@ -218,16 +250,17 @@ export class AppController {
     const session=this.store.sessions.find(item=>item.id===context.returnSessionId)??this.createSession(node,workspace);
     session.reloadToken=randomUUID();this.loginContext=undefined;
     await this.attach(node,workspace,session,true);
+    if(context.sessionId!==session.id)void this.removeSession(context.sessionId).catch(()=>undefined);
   }
   private closeTerminal(){this.readyWaiter?.reject(new Error('重载已取消。'));this.readyWaiter=undefined;if(this.retryTimer)clearTimeout(this.retryTimer);if(this.healthTimer)clearTimeout(this.healthTimer);this.retryTimer=undefined;this.healthTimer=undefined;const terminal=this.terminal;this.terminal=undefined;try{terminal?.kill();}catch{}}
   private async attach(node:ServiceNode,workspace:Workspace|undefined,session:SessionInfo,waitForReady=false){
     if((this.loginContext&&this.loginContext.sessionId!==session.id)||(this.state.browserLogin?.nodeId&&this.state.browserLogin.nodeId!==node.id)||node.providerId){this.loginContext=undefined;this.loginBrowser.block();}
     const generation=++this.generation;this.workspaceSetup?.abort.abort();this.workspaceSetup=undefined;this.closeTerminal();
-    this.gitState=undefined;this.nextGitCheck=0;
+    this.gitState=undefined;this.nextGitCheck=0;this.knownRemoteHead=undefined;
     this.state.sync={...this.state.sync,git:undefined};
     this.state.connection={phase:'preparing',message:'Preparing workspace',retryAttempt:0,activeNodeId:node.id,activeWorkspaceId:workspace?.id,activeSessionId:session.id};
     this.state.metrics=null;this.state.terminalBuffer='';this.state.workspacePreparation=workspace?{workspaceId:workspace.id,phase:'syncing',message:'正在同步工作区；首次使用将在就绪后启动会话。'}:undefined;this.publish();
-    if(session.kind!=='login')node.lastSessionId=session.id;node.lastWorkspaceId=workspace?.id;session.lastActiveAt=new Date().toISOString();await this.store.save();
+    if(session.kind!=='login')node.lastSessionId=session.id;node.lastWorkspaceId=workspace?.id;session.lastActiveAt=new Date().toISOString();this.store.saveSoon();
     try{
       if(!workspace){this.state.sync=emptySync();void this.sync.pause().catch(error=>this.activity({kind:'error',title:'暂停工作区同步失败',detail:(error as Error).message}));}
       if(generation!==this.generation){if(waitForReady)throw new Error('重载已取消。');return;}
@@ -254,7 +287,7 @@ export class AppController {
     const current=()=>!task.abort.signal.aborted&&generation===this.generation;
     task.promise=(async()=>{
       try{
-        const initial=await this.sync.ensure(workspace,node);
+        const initial=await this.sync.ensure(workspace,node,{reuse:true});
         if(!current())return;
         if(initial.phase==='error')throw new Error(initial.message);
         await this.sync.waitUntilReady(task.abort.signal,()=>workspace.syncSessionName);
@@ -349,7 +382,7 @@ export class AppController {
       return;
     }
     if(!force&&Date.now()<this.nextGitCheck)return;
-    this.nextGitCheck=Date.now()+10000;
+    this.nextGitCheck=Date.now()+10000;this.lastGitCheck=Date.now();
     const workspace=this.store.workspace(workspaceId),node=this.store.node(workspace.nodeId);
     const current=()=>generation===this.generation&&workspaceId===this.state.connection.activeWorkspaceId&&this.state.connection.phase==='connected'&&this.state.sync.phase==='ready'&&this.state.workspacePreparation?.phase==='ready';
     const previous=this.gitState?.state;
@@ -413,5 +446,5 @@ export class AppController {
     const forward={id:randomUUID(),localPort,remotePort,nodeId:node.id};this.forwards.set(forward.id,{process:child,forward});child.once('exit',()=>{if(this.forwards.delete(forward.id))this.activity({kind:'connection',title:'Port forwarding closed',detail:'127.0.0.1:'+localPort});});this.publish();return forward;
   }
   async removePortForward(id:string){const entry=this.forwards.get(id);if(entry){this.forwards.delete(id);entry.process.kill();this.publish();}}
-  async dispose(){await this.disconnect();await this.gitSynchronization?.promise;await this.loginBrowser.dispose();for(const entry of this.forwards.values())entry.process.kill();this.forwards.clear();await this.sync.dispose();await this.bridge.stop();await this.store.save();}
+  async dispose(){if(this.publishTimer)clearTimeout(this.publishTimer);await this.disconnect();await this.gitSynchronization?.promise;await this.loginBrowser.dispose();for(const entry of this.forwards.values())entry.process.kill();this.forwards.clear();await this.sync.dispose();await this.bridge.stop();closeSshChannels();await this.store.save();}
 }

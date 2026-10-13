@@ -250,11 +250,17 @@ describe('automatic Git commit synchronization',()=>{
     await vi.waitFor(()=>expect(controller!.snapshot().workspacePreparation?.phase).toBe('ready'));
     syncMocks.state(ready);
   }
-  it('checks ready workspaces automatically, throttles idle polls and checks commit-only changes again',async()=>{
+  it('checks once when ready, then only on a changed remote HEAD or a slow safety interval',async()=>{
     await connect();await vi.waitFor(()=>expect(gitMocks.sync).toHaveBeenCalledTimes(1));
-    syncMocks.state(ready);await vi.advanceTimersByTimeAsync(1);expect(gitMocks.sync).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(10000);syncMocks.state(ready);
+    syncMocks.state(ready);await vi.advanceTimersByTimeAsync(10000);syncMocks.state(ready);await vi.advanceTimersByTimeAsync(1);
+    expect(gitMocks.sync).toHaveBeenCalledTimes(1);
+    const metrics=(gitHead:string)=>({type:'metrics',nodeId:'test-node',sessionId:controller!.snapshot().connection.activeSessionId,metrics:{hostname:'h',os:'Linux',cpuCount:1,load:0,memoryTotal:1,memoryAvailable:1,diskAvailable:1,uptime:1,claudeVersion:null,authenticated:true,address:'a',gitHead,sampledAt:''}});
+    (controller as any).remoteEvent(metrics('a'.repeat(40)));
     await vi.waitFor(()=>expect(gitMocks.sync).toHaveBeenCalledTimes(2));
+    (controller as any).remoteEvent(metrics('a'.repeat(40)));await vi.advanceTimersByTimeAsync(1);
+    expect(gitMocks.sync).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(61000);syncMocks.state(ready);
+    await vi.waitFor(()=>expect(gitMocks.sync).toHaveBeenCalledTimes(3));
     expect(workspaceSyncLabel(controller!.snapshot().sync)).toBe('已同步');
   });
   it('checks after remote tool completion without waiting for the next idle interval',async()=>{
