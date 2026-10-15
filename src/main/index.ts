@@ -5,7 +5,7 @@ import { mkdir,readFile,writeFile } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
 import { AppController } from './controller';
 import { checkLoginWebsite } from './login-network';
-import { readClipboardContent } from './clipboard';
+import { readClipboardContent,writeClipboardText } from './clipboard';
 
 let window:BrowserWindow|undefined;
 let controller:AppController|undefined;
@@ -62,7 +62,7 @@ async function start(){
     chooseWorkspace:id=>controller!.chooseWorkspace(id),connect:(...args)=>controller!.connect(args[0],args[1],args[2]),disconnect:()=>controller!.disconnect(),newSession:kind=>controller!.newSession(kind),removeSession:id=>controller!.removeSession(id),
     setLocalAccess:(id,enabled)=>{if(typeof enabled!=='boolean')throw new Error('Invalid local access setting');return controller!.setLocalAccess(id,enabled);},
     syncNow:()=>controller!.syncNow(),pauseSync:()=>controller!.pauseSync(),resolveConflict:(path,prefer)=>controller!.resolveConflict(path,prefer),
-    pasteClipboard:request=>controller!.pasteClipboard(request),
+    copyText:text=>writeClipboardText(clipboard,text),pasteClipboard:request=>controller!.pasteClipboard(request),
     openLocalPath:id=>controller!.openLocalPath(id),openExternal:url=>controller!.openExternal(url),listLocalHistory:()=>controller!.listLocalHistory(),
     importHistory:request=>controller!.importHistory(request),resumeImported:(id,path)=>controller!.resumeImported(id,path),
     importProjectMemory:id=>controller!.importProjectMemory(id),

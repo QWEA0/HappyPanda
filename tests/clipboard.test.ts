@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { resolve } from 'node:path';
 import { describe,expect,it,vi } from 'vitest';
 import type { Clipboard } from 'electron';
-import { ClipboardImageUploader,MAX_CLIPBOARD_IMAGE_BYTES,readClipboardContent,terminalPaste,validateClipboardPng } from '../src/main/clipboard';
+import { ClipboardImageUploader,MAX_CLIPBOARD_IMAGE_BYTES,readClipboardContent,terminalPaste,validateClipboardPng,writeClipboardText } from '../src/main/clipboard';
 
 const png=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aMioAAAAASUVORK5CYII=','base64');
 const hash=(value:Buffer|string)=>createHash('sha256').update(value).digest('hex');
@@ -10,6 +10,22 @@ const node={id:'node',name:'test',sshTarget:'test-host',createdAt:''};
 function clipboard(values:Record<string,Blob>):Pick<Clipboard,'read'>{
   return {read:vi.fn(async()=>[{types:Object.keys(values),getType:async(type:string)=>values[type]}] as any)};
 }
+
+describe('clipboard text output',()=>{
+  it('writes selected Unicode text with its whitespace intact through the native clipboard',async()=>{
+    const output={writeText:vi.fn(async()=>{})};
+    const text=' \u4e2d\u6587\r\nsecond\tline ';
+    await writeClipboardText(output,text);
+    expect(output.writeText).toHaveBeenCalledExactlyOnceWith(text);
+  });
+  it('rejects non-text IPC input without changing the clipboard and propagates write failures',async()=>{
+    const output={writeText:vi.fn(async()=>{})};
+    await expect(writeClipboardText(output,{text:'unexpected'})).rejects.toThrow('复制');
+    expect(output.writeText).not.toHaveBeenCalled();
+    output.writeText.mockRejectedValueOnce(new Error('Clipboard unavailable'));
+    await expect(writeClipboardText(output,'selection')).rejects.toThrow('Clipboard unavailable');
+  });
+});
 
 describe('clipboard image and text input',()=>{
   it('reads Electron ClipboardItems and prefers a copied image over its accompanying URL',async()=>{

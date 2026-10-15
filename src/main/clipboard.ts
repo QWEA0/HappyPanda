@@ -9,6 +9,11 @@ export const MAX_CLIPBOARD_IMAGE_BYTES=20*1024*1024;
 const MAX_IMAGE_PIXELS=40_000_000;
 export type ClipboardContent={kind:'image';png:Buffer}|{kind:'text';text:string}|{kind:'empty'};
 
+export async function writeClipboardText(clipboard:Pick<Clipboard,'writeText'>,text:unknown):Promise<void> {
+  if(typeof text!=='string')throw new Error('无效的复制内容。');
+  await clipboard.writeText(text);
+}
+
 export function validateClipboardPng(png:Buffer):void {
   if(png.length>MAX_CLIPBOARD_IMAGE_BYTES)throw new Error('剪贴板图片超过 20 MiB，请缩小图片后重试。');
   if(png.length<33||!png.subarray(0,8).equals(Buffer.from('89504e470d0a1a0a','hex'))||png.readUInt32BE(8)!==13||png.toString('ascii',12,16)!=='IHDR')throw new Error('剪贴板图片不是有效的 PNG。');

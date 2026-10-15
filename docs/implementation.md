@@ -64,7 +64,21 @@ display the UI and the real configured initial node in a disconnected state.
 Desktop-dependent operations return an explicit error. It does not simulate
 SSH connections, server metrics, or Claude conversations.
 
-## Clipboard image paste
+## Terminal copy and clipboard image paste
+
+Terminal selection copy uses the typed preload IPC and Electron's native
+`clipboard.writeText` in the main process, with the same trusted-frame validation
+as other application IPC. This avoids renderer clipboard focus requirements.
+Ctrl+C copies when text is selected and sends the normal terminal interrupt when
+there is no selection. Ctrl+Shift+C, Cmd+C and the existing toolbar/menu actions
+also copy through this path. Copy remains available after disconnect and preserves
+Unicode, whitespace and line endings.
+
+After building, `npm run smoke:clipboard-copy` checks these paths against the real
+system clipboard and built renderer without SSH or model requests, including a
+native paste into a regular text field. It also checks empty selections, interrupts
+and text paste, and restores the original clipboard unless the user has copied
+new content during the check.
 
 The terminal paste action handles Ctrl+V, Ctrl+Shift+V, Cmd+V, Shift+Insert,
 native paste events and the existing toolbar/menu button. Electron 44's asynchronous

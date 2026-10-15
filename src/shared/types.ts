@@ -171,6 +171,7 @@ export interface HappyPandaAPI {
   newSession(kind?: 'claude' | 'login' | 'shell'): Promise<void>;
   removeSession(id: string): Promise<void>;
   writeTerminal(data: string): void;
+  copyText(text: string): Promise<void>;
   pasteClipboard(request:TerminalPasteRequest):Promise<TerminalPasteResult>;
   resizeTerminal(cols: number, rows: number): void;
   setLocalAccess(workspaceId: string, enabled: boolean): Promise<void>;

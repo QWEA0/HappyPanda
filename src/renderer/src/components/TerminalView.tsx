@@ -36,7 +36,7 @@ export const TerminalView = forwardRef<TerminalHandle, TerminalProps>(function T
     const selection = terminalRef.current?.getSelection();
     if (!selection) { propsRef.current.onInfo('请先选中要复制的终端内容。'); return; }
     try {
-      await navigator.clipboard.writeText(selection);
+      await requireDesktop().copyText(selection);
     } catch (error) {
       propsRef.current.onError('复制失败', errorText(error));
     }
@@ -134,10 +134,10 @@ export const TerminalView = forwardRef<TerminalHandle, TerminalProps>(function T
     });
     terminal.attachCustomKeyEventHandler((event) => {
       if (event.type !== 'keydown') return true;
-      const clipboardShortcut = event.metaKey || (event.ctrlKey && event.shiftKey);
-      if (clipboardShortcut && event.code === 'KeyC') {
+      const copyShortcut = !event.altKey && (event.metaKey || (event.ctrlKey && (event.shiftKey || terminal.hasSelection())));
+      if (copyShortcut && event.code === 'KeyC') {
         event.preventDefault();
-        void copy();
+        if (!event.repeat) void copy();
         return false;
       }
       if (!event.altKey&&((event.code==='KeyV'&&(event.ctrlKey||event.metaKey))||(event.code==='Insert'&&event.shiftKey))) {

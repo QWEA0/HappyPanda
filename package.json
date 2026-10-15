@@ -21,7 +21,8 @@
     "smoke:remote": "tsx scripts/remote-smoke.ts",
     "smoke:providers": "tsx scripts/provider-smoke.ts",
     "smoke:login": "tsx scripts/login-browser-smoke.ts",
-    "smoke:clipboard": "node scripts/clipboard-smoke.cjs"
+    "smoke:clipboard": "node scripts/clipboard-smoke.cjs",
+    "smoke:clipboard-copy": "node scripts/clipboard-copy-smoke.cjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.32.1",

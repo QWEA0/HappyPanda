@@ -51,6 +51,8 @@ MVP 使用 node-pty 的 N-API 预编译二进制文件，electron-builder 配置
 
 截图或复制图片后，点击已连接的终端，按 `Ctrl+V`（也支持 `Ctrl+Shift+V`、macOS `Cmd+V`），或点击“粘贴到终端”。图片上传完成后，输入区会出现服务器图片路径；补充说明后按 Enter 发送。截图保存在服务器的应用附件目录，独立于项目和 Git；无需先保存到项目、开启本地 MCP 或等待文件同步。文字剪贴板仍按文字粘贴。上传失败、断线或切换会话时不会把图片填进其他终端。当前支持系统剪贴板中的 PNG 图片，单张最多 20 MiB；从文件管理器复制图片文件与复制图片内容不同。
 
+选中终端文字后，按 `Ctrl+C`、`Ctrl+Shift+C`（macOS `Cmd+C`），或点击“复制终端选区”，即可复制到系统剪贴板并粘贴到其他应用。中文、多行文字和断线后保留的终端内容均可复制。没有选区时，`Ctrl+C` 继续用于中断当前命令。
+
 提供商密钥通过系统加密服务保存在应用数据目录中；编辑时留空保留原密钥，不会向界面回传已保存的密钥。远程会话配置通过 SSH 标准输入传输，写入应用自己的私有运行目录，不修改 shell 配置或项目中的 Claude 设置。重载会中断当前任务并恢复已保存的对话，终端里尚未提交的输入不保留；其他 tmux 会话在下次接回时应用新的提供商。普通“重新连接”在配置未变时继续保留原进程。
 
 节点登录浏览器不使用日常浏览器配置，Cookie 按节点独立保留。HTTP(S) 与登录的 localhost 回调都通过当前节点的 SOCKS5 通道；禁止代理直连回退，并限制 QUIC 和非代理 WebRTC UDP。隧道中断后，专用本地代理端口仍保留并拒绝连接。采用此登录方式的节点，其官方 Claude 会话会清理继承的代理变量，直接从节点出站。该功能统一的是节点网络路由，浏览器仍运行在本机；不能保证服务方无法识别代理、VPS 或设备环境，也不能保证账号不会受限。
@@ -68,6 +70,7 @@ npm run smoke:remote -- your-ssh-alias
 npm run smoke:providers -- your-ssh-alias
 npm run smoke:login -- your-ssh-alias
 npm run smoke:clipboard
+npm run smoke:clipboard-copy
 python tests/provider_runtime_test.py
 python tests/image_upload_test.py
 ```
@@ -81,6 +84,7 @@ python tests/image_upload_test.py
 - `smoke:providers`：使用真实 VPS 的隔离 tmux 服务、合成密钥和模拟 CLI，验证提供商切换、更换进程、恢复会话、重连幂等、凭据隔离及切回官方模式；结果保存到 `.local/provider-smoke-result.json`，不发起模型请求。
 - `smoke:login`：验证真实 SSH SOCKS、远程 localhost 回调、浏览器访问探测、断线拒绝连接与过期授权阻断，结果保存到 `.local/login-browser-smoke-result.json`。浏览器导航由合成 HTTP 请求模拟，不完成真实 OAuth 登录。
 - `smoke:clipboard`：使用测试图片、真实 Windows 剪贴板、构建后的终端界面和独立远端 Shell，验证 Ctrl+V、粘贴按钮、文字回归与图片 SHA-256。测试结束恢复原剪贴板；若期间用户已复制新内容则保留新内容。结果保存在 `.local/clipboard-smoke-result.json`，不调用模型。
+- `smoke:clipboard-copy`：构建后运行，无需 SSH 或模型，验证终端选区通过快捷键、按钮和菜单写入真实系统剪贴板，以及中文多行、断线复制、空选区、Ctrl+C 中断和文字粘贴。测试结束按上述规则恢复剪贴板，结果保存在 `.local/clipboard-copy-smoke-result.json`。
 - `python tests/provider_runtime_test.py`：验证远程启动参数、环境冲突清理、导入后对话续接与重载逻辑，不需要 SSH 或模型密钥。
 
 历史记录传输会校验 SHA-256，并跳过已完整传输且校验一致的文件。传输中断留下的 `.part` 文件会重新完整上传，这是整文件重试，不支持按字节断点续传。
