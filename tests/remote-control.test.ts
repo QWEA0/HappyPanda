@@ -519,6 +519,37 @@ describe('ordered SSE events and device connection lifecycle', () => {
     expect(delivered).not.toContain('tokenDigest');
   });
 
+  it('coalesces bursts of terminal output into one frame without reordering other events', async () => {
+    const fx = await fixture();
+    const paired = await pair(fx);
+    const stream = await events(fx, paired.cookie);
+    const chunks: AppEvent[] = ['a', 'b', 'c'].map((data, index) => ({ type: 'terminal', data, sessionId: 's', generation: 1, end: index + 1 }));
+    for (const chunk of chunks) fx.server.publish(chunk);
+    fx.server.publish({ type: 'terminal-size', cols: 45, rows: 30, sessionId: 's' });
+    fx.server.publish({ type: 'terminal', data: 'd', sessionId: 's', generation: 1, end: 4 });
+    fx.server.publish({ type: 'terminal', data: 'other', sessionId: 't', generation: 1, end: 5 });
+    await until(() => stream.events.length >= 6);
+    expect(stream.events.slice(2).map(event => event.data)).toEqual([
+      { type: 'terminal', data: 'abc', sessionId: 's', generation: 1, end: 3 },
+      { type: 'terminal-size', cols: 45, rows: 30, sessionId: 's' },
+      { type: 'terminal', data: 'd', sessionId: 's', generation: 1, end: 4 },
+      { type: 'terminal', data: 'other', sessionId: 't', generation: 1, end: 5 },
+    ]);
+    expect(chunks[0]).toMatchObject({ data: 'a', end: 1 });
+  });
+
+  it('flushes pending output to existing streams before a new stream takes its snapshot', async () => {
+    const fx = await fixture();
+    const paired = await pair(fx);
+    const first = await events(fx, paired.cookie);
+    fx.server.publish({ type: 'terminal', data: 'already in snapshot' });
+    const second = await events(fx, paired.cookie);
+    await until(() => first.events.length >= 3);
+    await delay(40);
+    expect(first.events[2].data).toEqual({ type: 'terminal', data: 'already in snapshot' });
+    expect(second.events.map(event => event.name)).toEqual(['snapshot', 'session']);
+  });
+
   it('delivers both initial events before updates triggered by the connected-device notification', async () => {
     const fx = await fixture();
     const paired = await pair(fx);

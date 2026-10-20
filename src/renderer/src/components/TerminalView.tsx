@@ -1,13 +1,16 @@
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from 'react';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
+import { Unicode11Addon } from '@xterm/addon-unicode11';
+import { WebglAddon } from '@xterm/addon-webgl';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 import { AlertTriangle, LoaderCircle, Terminal as TerminalIcon } from 'lucide-react';
 import type { AppEvent, AppState, OpenSessionState } from '../../../shared/types';
 import { errorText, requireDesktop } from '../api';
 import { connectionLabels } from '../format';
-import { terminalPaste } from '../../../shared/terminal';
+import { lastTerminalSizeMark, parseTerminalSize, TERMINAL_SIZE_OSC, terminalHasOutput, terminalPaste } from '../../../shared/terminal';
 import { terminalDisplayScale } from '../remote-terminal-tools';
+import { attachTouchScroll, terminalScrollTarget } from '../terminal-touch-scroll';
 
 export interface TerminalHandle {
   copy(): Promise<void>;
@@ -41,6 +44,8 @@ function target(props: TerminalProps) {
   return { nodeId: activeNodeId, sessionId: activeSessionId, phase, message };
 }
 const targetContext = (props: TerminalProps) => { const { nodeId, sessionId } = target(props); return `${nodeId || ''}/${sessionId || ''}`; };
+/** Only the visible view of the controlling side sizes the PTY; every other view follows the size marks in the output. */
+const decidesSize = (props: TerminalProps) => Boolean(window.happyPanda) && props.inputEnabled !== false && (!props.session || Boolean(props.active));
 
 export const TerminalView = forwardRef<TerminalHandle, TerminalProps>(function TerminalView(props, ref) {
   const viewportRef = useRef<HTMLDivElement>(null);
@@ -49,7 +54,7 @@ export const TerminalView = forwardRef<TerminalHandle, TerminalProps>(function T
   const fitRef = useRef<(() => void) | null>(null);
   const propsRef = useRef(props);
   propsRef.current = props;
-  const [hasOutput, setHasOutput] = useState(Boolean(!props.session && props.state.terminalBuffer));
+  const [hasOutput, setHasOutput] = useState(Boolean(!props.session && terminalHasOutput(props.state.terminalBuffer)));
   const [pastingContext,setPastingContext]=useState<string|null>(null);
   const pasteRef=useRef<{context:string}|null>(null);
 
@@ -98,6 +103,7 @@ export const TerminalView = forwardRef<TerminalHandle, TerminalProps>(function T
   useEffect(() => {
     if (!hostRef.current) return;
     const bound = propsRef.current.session?.sessionId;
+    const mobile = Boolean(propsRef.current.mobile);
     const terminal = new Terminal({
       cols: propsRef.current.state.terminalSize?.cols ?? 100,
       rows: propsRef.current.state.terminalSize?.rows ?? 32,
@@ -110,7 +116,12 @@ export const TerminalView = forwardRef<TerminalHandle, TerminalProps>(function T
       cursorBlink: true,
       cursorStyle: 'block',
       scrollback: 10000,
-      screenReaderMode: true,
+      // The phone types through its own composer; the accessibility tree would double the DOM work of every scroll.
+      screenReaderMode: !mobile,
+      // Needed for the Unicode 11 width table below.
+      allowProposedApi: true,
+      // Ambiguous-width glyphs from fallback fonts are scaled into their cells instead of overlapping neighbours.
+      rescaleOverlappingGlyphs: true,
       rightClickSelectsWord: true,
       disableStdin: !window.happyPanda || target(propsRef.current).phase !== 'connected' || propsRef.current.inputEnabled === false,
       theme: {
@@ -124,6 +135,9 @@ export const TerminalView = forwardRef<TerminalHandle, TerminalProps>(function T
     });
     const fit = new FitAddon();
     terminal.loadAddon(fit);
+    // Claude Code measures emoji and CJK with modern width tables; xterm's default Unicode 6 widths misplace the cursor.
+    terminal.loadAddon(new Unicode11Addon());
+    terminal.unicode.activeVersion = '11';
     terminal.loadAddon(new WebLinksAddon((event, url) => {
       event.preventDefault();
       try {
@@ -135,14 +149,30 @@ export const TerminalView = forwardRef<TerminalHandle, TerminalProps>(function T
       }
     }));
     terminal.open(hostRef.current);
+    // The GPU renderer keeps every glyph on the cell grid and scrolls without rebuilding DOM rows; fall back to DOM if it is lost.
+    let webgl: WebglAddon | undefined;
+    try {
+      webgl = new WebglAddon();
+      webgl.onContextLoss(() => { webgl?.dispose(); webgl = undefined; });
+      terminal.loadAddon(webgl);
+    } catch { webgl?.dispose(); webgl = undefined; }
     terminalRef.current = terminal;
     let currentContext = contextId(propsRef.current.state);
     let outputReceived = false;
     let disposed = false;
     let frame = 0;
-    const received = (data: string) => {
-      terminal.write(data);
-      if (data && !outputReceived) { outputReceived = true; setHasOutput(true); }
+    // Size marks always apply while scrollback is replayed; live, only views that do not size the PTY follow them.
+    let replaying = 0;
+    let ptySize = bound ? undefined : propsRef.current.state.terminalSize;
+    const sizeMarks = terminal.parser.registerOscHandler(TERMINAL_SIZE_OSC, payload => {
+      const size = parseTerminalSize(payload);
+      if (size && (replaying > 0 || !decidesSize(propsRef.current))) terminal.resize(size.cols, size.rows);
+      return true;
+    });
+    const received = (data: string, replay = false) => {
+      if (replay) { replaying++; terminal.write(data, () => { replaying--; scheduleFit(); }); }
+      else terminal.write(data);
+      if (!outputReceived && terminalHasOutput(data)) { outputReceived = true; setHasOutput(true); }
     };
     // A bound view tracks the PTY generation (a reattach starts a new terminal) and the
     // output offset, so scrollback fetched on mount splices exactly with streamed events.
@@ -170,16 +200,33 @@ export const TerminalView = forwardRef<TerminalHandle, TerminalProps>(function T
         const pending = queued ?? [];
         queued = null;
         generation = buffer.generation; end = buffer.end;
-        if (buffer.data) received(buffer.data);
+        if (buffer.cols && buffer.rows) ptySize = { cols: buffer.cols, rows: buffer.rows };
+        if (buffer.data) received(buffer.data, true);
         for (const event of pending) boundOutput(event);
+        scheduleFit();
       }).catch(error => {
         const pending = queued ?? [];
         queued = null;
         for (const event of pending) boundOutput(event);
         propsRef.current.onError('读取终端历史失败', errorText(error));
       });
-    } else if (propsRef.current.state.terminalBuffer) received(propsRef.current.state.terminalBuffer);
+    } else if (propsRef.current.state.terminalBuffer) received(propsRef.current.state.terminalBuffer, true);
 
+    // The controlling view tells the PTY its size whenever they differ, not only when xterm itself resized:
+    // after a phone hands control back, the desktop xterm may already have its own size while the PTY does not.
+    const syncPtySize = () => {
+      if (!decidesSize(propsRef.current) || replaying > 0) return;
+      const { cols, rows } = terminal;
+      if (ptySize?.cols === cols && ptySize.rows === rows) return;
+      const previous = ptySize;
+      ptySize = { cols, rows };
+      try {
+        void Promise.resolve(window.happyPanda!.resizeTerminal(cols, rows, bound)).catch(error => {
+          if (ptySize?.cols === cols && ptySize.rows === rows) ptySize = previous;
+          propsRef.current.onError('调整远程终端失败', errorText(error));
+        });
+      } catch (error) { ptySize = previous; propsRef.current.onError('调整远程终端失败', errorText(error)); }
+    };
     const scheduleFit = () => {
       window.cancelAnimationFrame(frame);
       frame = window.requestAnimationFrame(() => {
@@ -191,14 +238,11 @@ export const TerminalView = forwardRef<TerminalHandle, TerminalProps>(function T
           host.style.height = '';
           host.style.transform = '';
           host.dataset.terminalScale = '1';
-          const size = propsRef.current.state.terminalSize;
-          if (propsRef.current.inputEnabled === false && size) {
-            terminal.resize(size.cols, size.rows);
-          }
-          else {
+          if (decidesSize(propsRef.current)) {
             const size = fit.proposeDimensions();
             // Keep short keyboard viewports within the PTY's accepted dimensions.
             if (size) terminal.resize(Math.max(10, Math.min(500, size.cols)), Math.max(3, Math.min(300, size.rows)));
+            syncPtySize();
           }
           const screen = terminal.element?.querySelector<HTMLElement>('.xterm-screen');
           if (propsRef.current.fitToViewport && viewport && screen) {
@@ -221,11 +265,14 @@ export const TerminalView = forwardRef<TerminalHandle, TerminalProps>(function T
       try { void Promise.resolve(requireDesktop().writeTerminal(data, bound)).catch(error => propsRef.current.onError('终端输入失败', errorText(error))); }
       catch (error) { propsRef.current.onError('终端输入失败', errorText(error)); }
     });
-    const resize = terminal.onResize(({ cols, rows }) => {
-      if (!window.happyPanda || propsRef.current.inputEnabled === false || (bound && !propsRef.current.active)) return;
-      try { void Promise.resolve(window.happyPanda.resizeTerminal(cols, rows, bound)).catch(error => propsRef.current.onError('调整远程终端失败', errorText(error))); }
-      catch (error) { propsRef.current.onError('调整远程终端失败', errorText(error)); }
-    });
+    // A size mark changes the screen size, so the phone's fit-to-viewport scale must follow.
+    const resize = terminal.onResize(() => scheduleFit());
+    const host=hostRef.current;
+    const stopTouchScroll = mobile && viewportRef.current ? attachTouchScroll(viewportRef.current, terminalScrollTarget(terminal, {
+      viewport: viewportRef.current,
+      scale: () => Number(host.dataset.terminalScale) || 1,
+      canType: () => propsRef.current.inputEnabled !== false && target(propsRef.current).phase === 'connected',
+    })) : undefined;
     terminal.attachCustomKeyEventHandler((event) => {
       if (event.type !== 'keydown') return true;
       const copyShortcut = !event.altKey && (event.metaKey || (event.ctrlKey && (event.shiftKey || terminal.hasSelection())));
@@ -244,7 +291,6 @@ export const TerminalView = forwardRef<TerminalHandle, TerminalProps>(function T
       return true;
     });
     // Catch native/context-menu paste before xterm's text-only handler.
-    const host=hostRef.current;
     const pasteEvent=(event:ClipboardEvent)=>{
       event.preventDefault();event.stopImmediatePropagation();
       if(propsRef.current.mobile&&event.clipboardData){
@@ -268,6 +314,8 @@ export const TerminalView = forwardRef<TerminalHandle, TerminalProps>(function T
         if (bound) {
           if (event.type === 'terminal' && event.sessionId === bound) {
             if (queued) queued.push(event); else boundOutput(event);
+          } else if (event.type === 'terminal-size' && event.sessionId === bound) {
+            ptySize = { cols: event.cols, rows: event.rows };
           } else if (event.type === 'state' && !queued) {
             const next = event.state.openSessions?.find(item => item.sessionId === bound)?.generation;
             if (next !== undefined && next > generation) restart(next);
@@ -277,19 +325,22 @@ export const TerminalView = forwardRef<TerminalHandle, TerminalProps>(function T
         if (event.type === 'terminal') {
           received(event.data);
         } else if (event.type === 'terminal-size') {
-          if (propsRef.current.inputEnabled === false) terminal.resize(event.cols, event.rows);
+          // The xterm itself follows the size mark in the output stream, at the right byte.
+          ptySize = { cols: event.cols, rows: event.rows };
         } else if (event.type === 'state') {
           const nextContext = contextId(event.state);
           if (nextContext !== currentContext || event.resetTerminal) {
             currentContext = nextContext;
             terminal.reset();
-            if (propsRef.current.inputEnabled === false && event.state.terminalSize) terminal.resize(event.state.terminalSize.cols, event.state.terminalSize.rows);
-            outputReceived = Boolean(event.state.terminalBuffer);
-            setHasOutput(outputReceived);
-            if (event.state.terminalBuffer) terminal.write(event.state.terminalBuffer);
+            ptySize = event.state.terminalSize;
+            const size = event.state.terminalSize, buffer = event.state.terminalBuffer;
+            if (!decidesSize(propsRef.current) && size && !lastTerminalSizeMark(buffer)) terminal.resize(size.cols, size.rows);
+            outputReceived = false;
+            setHasOutput(false);
+            if (buffer) received(buffer, true);
             scheduleFit();
-          } else if (!outputReceived && event.state.terminalBuffer) {
-            received(event.state.terminalBuffer);
+          } else if (!outputReceived && terminalHasOutput(event.state.terminalBuffer)) {
+            received(event.state.terminalBuffer, true);
           }
         }
       });
@@ -302,9 +353,11 @@ export const TerminalView = forwardRef<TerminalHandle, TerminalProps>(function T
       window.cancelAnimationFrame(frame);
       observer.disconnect();
       unsubscribe?.();
+      stopTouchScroll?.();
       host.removeEventListener('paste',pasteEvent,true);
       input.dispose();
       resize.dispose();
+      sizeMarks.dispose();
       terminal.dispose();
       terminalRef.current = null;
       fitRef.current = null;

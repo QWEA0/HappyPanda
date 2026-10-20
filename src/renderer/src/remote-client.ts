@@ -1,6 +1,6 @@
 import type { AppEvent, AppState, HappyPandaAPI, TerminalPasteRequest, TerminalPasteResult } from '../../shared/types';
 import { DESKTOP_OWNER, REMOTE_RPC_WRITE_METHODS, type RemoteClientStatus, type RemoteSessionInfo, type RemoteTerminalContext } from '../../shared/remote';
-import { terminalPaste } from '../../shared/terminal';
+import { appendTerminalOutput, terminalPaste } from '../../shared/terminal';
 
 export const isRemotePage = () => window.location.pathname.startsWith('/remote/');
 
@@ -63,7 +63,7 @@ export class RemoteClient {
     focusSession: id => this.rpc('focusSession', id),
     closeSession: id => this.rpc('closeSession', id),
     // The phone mirrors the focused session only; its scrollback arrives with state snapshots.
-    getTerminalBuffer: async () => ({ generation: this.snapshot?.terminalGeneration ?? 0, data: this.snapshot?.terminalBuffer ?? '', end: 0 }),
+    getTerminalBuffer: async () => ({ generation: this.snapshot?.terminalGeneration ?? 0, data: this.snapshot?.terminalBuffer ?? '', end: 0, ...this.snapshot?.terminalSize }),
     newSession: kind => this.rpc('newSession', kind),
     removeSession: id => this.rpc('removeSession', id),
     writeTerminal: data => this.writeTerminal(data),
@@ -106,7 +106,7 @@ export class RemoteClient {
       if (event.resetTerminal || !this.snapshot || this.terminalKey(this.snapshot) !== this.terminalKey(event.state)) this.inputGeneration += 1;
       this.snapshot = { ...event.state, terminalBuffer: event.resetTerminal ? event.state.terminalBuffer : sameSession ? this.snapshot!.terminalBuffer : event.state.terminalBuffer };
     } else if (event.type === 'terminal' && this.snapshot) {
-      this.snapshot.terminalBuffer = (this.snapshot.terminalBuffer + event.data).slice(-512000);
+      this.snapshot.terminalBuffer = appendTerminalOutput(this.snapshot.terminalBuffer, event.data);
     } else if (event.type === 'terminal-size' && this.snapshot) {
       this.snapshot.terminalSize = { cols: event.cols, rows: event.rows };
     } else if (event.type === 'activity' && this.snapshot) {

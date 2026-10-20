@@ -31,6 +31,9 @@ const COOKIE_AGE_SECONDS = 30 * 24 * 60 * 60;
 const PAIRING_LIFETIME = 5 * 60 * 1000;
 const HEARTBEAT_INTERVAL = 15000;
 const STREAM_BUFFER_LIMIT = 2 * 1024 * 1024;
+// Terminal output is sent to phones in frames of up to one display refresh, like a terminal's render loop.
+const OUTPUT_FLUSH_DELAY = 16;
+const OUTPUT_BATCH_LIMIT = 64 * 1024;
 const MAX_DEVICES = 64;
 const hash = (value: string): Buffer => createHash('sha256').update(value).digest();
 const equal = (a: string, b: string): boolean => timingSafeEqual(hash(a), hash(b));
@@ -131,6 +134,8 @@ export class RemoteControlServer {
   private generation = 0;
   private terminalEpoch = 0;
   private terminalSignature?: string;
+  private pendingOutput?: Extract<AppEvent, { type: 'terminal' }>;
+  private outputTimer?: ReturnType<typeof setTimeout>;
 
   constructor(private readonly options: RemoteControlServerOptions) {
     if (options.port !== undefined && (!Number.isInteger(options.port) || options.port < 0 || options.port > 65535)) throw new Error('远控端口无效。');
@@ -250,7 +255,33 @@ export class RemoteControlServer {
 
   publish(event: AppEvent): void {
     if (event.type === 'state') this.recordTerminalState(event.state);
-    if (this.enabled && this.streams.size) this.broadcast(frame('app', event));
+    if (!this.enabled || !this.streams.size) { this.discardOutput(); return; }
+    if (event.type !== 'terminal') { this.flushOutput(); this.broadcast(frame('app', event)); return; }
+    const pending = this.pendingOutput;
+    if (pending && pending.sessionId === event.sessionId && pending.generation === event.generation) {
+      pending.data += event.data;
+      pending.end = event.end;
+    } else { this.flushOutput(); this.pendingOutput = { ...event }; }
+    // Coalesced chunks keep their order relative to every other event: anything else flushes them first.
+    if (this.pendingOutput!.data.length >= OUTPUT_BATCH_LIMIT) this.flushOutput();
+    else if (!this.outputTimer) {
+      this.outputTimer = setTimeout(() => { this.outputTimer = undefined; this.flushOutput(); }, OUTPUT_FLUSH_DELAY);
+      this.outputTimer.unref();
+    }
+  }
+
+  private flushOutput(): void {
+    if (this.outputTimer) clearTimeout(this.outputTimer);
+    this.outputTimer = undefined;
+    const pending = this.pendingOutput;
+    this.pendingOutput = undefined;
+    if (pending && this.enabled) this.broadcast(frame('app', pending));
+  }
+
+  private discardOutput(): void {
+    if (this.outputTimer) clearTimeout(this.outputTimer);
+    this.outputTimer = undefined;
+    this.pendingOutput = undefined;
   }
 
   private recordTerminalState(state: AppState): void {
@@ -412,6 +443,7 @@ export class RemoteControlServer {
   private async stop(): Promise<void> {
     this.stopping = true;
     this.enabled = false;
+    this.discardOutput();
     this.generation++;
     this.clearPairing();
     if (this.heartbeat) clearInterval(this.heartbeat);
@@ -649,6 +681,8 @@ export class RemoteControlServer {
 
   private openEvents(device: StoredDevice, response: ServerResponse): void {
     if (this.streams.size >= 64 || [...this.streams].filter(stream => stream.deviceId === device.id).length >= 8) throw new HttpError(429, '远控页面数量过多，请关闭多余标签页。');
+    // Output already in the snapshot must reach only the streams that were open before it.
+    this.flushOutput();
     // Capture and write both initial events before onState can publish updates.
     const initial = frame('snapshot', this.options.getState()) + frame('session', this.session(device));
     response.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-store, no-transform', 'X-Accel-Buffering': 'no' });

@@ -22,6 +22,7 @@ import { HistoryImporter,listLocalHistory } from './history';
 import { GitWorkspace } from './git';
 import { ProjectMemoryImporter } from './memory';
 import { ClipboardImageUploader, terminalPaste, validateClipboardPng, type ClipboardContent } from './clipboard';
+import { lastTerminalSizeMark, terminalSizeMark, trimTerminalOutput } from '../shared/terminal';
 import type { TerminalPasteRequest, TerminalPasteResult, WorkspaceMode, ConnectionState, ServerMetrics, OpenSessionState, BrowserLoginState } from '../shared/types';
 import { emptySync, type SyncState,type AppState,type AppEvent,type ServiceNode,type SessionInfo,type Workspace,type ActivityEvent,type NodeInput,type ImportRequest,type PortForward,type ProviderInput } from '../shared/types';
 
@@ -38,11 +39,13 @@ const TERMINAL_SCROLLBACK=512000;
 /** Scrollback kept as chunks so a PTY read costs O(chunk) instead of copying the whole 512 KB tail. */
 class TerminalBuffer {
   private chunks:string[]=[];private size=0;private joined:string|undefined='';
+  /** Size mark in effect where the retained output starts, so a replay begins at the size that output was produced for. */
+  private head='';
   /** Characters appended since the last clear; terminal events carry it so a late reader can splice output exactly. */
   total=0;
-  append(data:string){this.total+=data.length;this.chunks.push(data);this.size+=data.length;this.joined=undefined;while(this.chunks.length>1&&this.size-this.chunks[0].length>=TERMINAL_SCROLLBACK)this.size-=this.chunks.shift()!.length;}
-  clear(){this.chunks=[];this.size=0;this.total=0;this.joined='';}
-  toString(){if(this.joined===undefined){const text=this.chunks.join('');this.joined=text.length>TERMINAL_SCROLLBACK?text.slice(-TERMINAL_SCROLLBACK):text;this.chunks=[this.joined];this.size=this.joined.length;}return this.joined;}
+  append(data:string){this.total+=data.length;this.chunks.push(data);this.size+=data.length;this.joined=undefined;while(this.chunks.length>1&&this.size-this.chunks[0].length>=TERMINAL_SCROLLBACK){const dropped=this.chunks.shift()!;this.size-=dropped.length;this.head=lastTerminalSizeMark(dropped)??this.head;}}
+  clear(head=''){this.chunks=[];this.size=0;this.total=0;this.joined=undefined;this.head=head;}
+  toString(){if(this.joined===undefined){const text=trimTerminalOutput(this.head+this.chunks.join(''),TERMINAL_SCROLLBACK+this.head.length);this.joined=text;this.head='';this.chunks=[text];this.size=text.length;}return this.joined;}
 }
 interface WorkspaceSetup {generation:number;abort:AbortController;promise:Promise<void>;failed:boolean;runtime:{helperPath:string;configPath:string}}
 /** One open session: its own PTY, scrollback, retry state and workspace readiness. */
@@ -175,7 +178,7 @@ export class AppController {
       terminalGeneration:slot?.generation??this.generation,openSessions:[...this.slots.values()].map(item=>this.openSession(item)),
       nodes:this.store.nodes,providers:this.providers.list(),workspaces:this.store.workspaces,sessions:this.store.sessions,portForwards:[...this.forwards.values()].map(entry=>entry.forward)});
   }
-  getTerminalBuffer(sessionId:string){const slot=this.slots.get(sessionId);return {generation:slot?.generation??0,data:slot?.buffer.toString()??'',end:slot?.buffer.total??0};}
+  getTerminalBuffer(sessionId:string){const slot=this.slots.get(sessionId);return {generation:slot?.generation??0,data:slot?.buffer.toString()??'',end:slot?.buffer.total??0,cols:slot?.cols,rows:slot?.rows};}
   // State events omit the (up to 512 KB) terminal scrollback: output already streams
   // as 'terminal' events and the renderer keeps its own copy; getState returns it whole.
   private publish(){
@@ -447,7 +450,7 @@ export class AppController {
     Object.assign(slot,{session,node,workspace,generation,metrics:null,unread:false,
       connection:{phase:'preparing',message:'Preparing workspace',retryAttempt:0,activeNodeId:node.id,activeWorkspaceId:workspace?.id,activeSessionId:session.id},
       preparation:workspace?{workspaceId:workspace.id,phase:'syncing',message:mcpOnly?'正在连接本机 MCP…':'正在同步工作区；首次使用将在就绪后启动会话。'}:undefined});
-    slot.buffer.clear();
+    slot.buffer.clear(terminalSizeMark(slot.cols,slot.rows));
     if(workspace&&!mcpOnly){const runtime=this.runtime(workspace);runtime.nextGitCheck=0;runtime.knownRemoteHead=undefined;}
     if(focus||!this.focused())this.focusId=session.id;
     const focused=this.focusId===session.id;
@@ -612,7 +615,11 @@ export class AppController {
       const slot=sessionId===undefined?this.focused():this.slots.get(sessionId);if(!slot)return;
       const changed=slot.cols!==cols||slot.rows!==rows;
       slot.cols=cols;slot.rows=rows;slot.terminal?.resize(cols,rows);
-      if(changed)this.options.emit({type:'terminal-size',cols,rows,sessionId:slot.session.id});
+      if(!changed)return;
+      // Record the resize at this point of the output, so observers and later replays switch size at the right byte.
+      const mark=terminalSizeMark(cols,rows);slot.buffer.append(mark);
+      this.options.emit({type:'terminal',data:mark,sessionId:slot.session.id,generation:slot.generation,end:slot.buffer.total});
+      this.options.emit({type:'terminal-size',cols,rows,sessionId:slot.session.id});
     }
   }
   /** Closes every tab and returns to the node list. */

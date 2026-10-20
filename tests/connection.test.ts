@@ -26,6 +26,7 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 import { AppController } from '../src/main/controller';
 import { TEST_NODE } from './fixtures/node';
 import { workspaceSyncLabel,workspaceSyncTone } from '../src/renderer/src/format';
+import { terminalSizeMark } from '../src/shared/terminal';
 
 let controller:AppController|undefined;
 let directory:string;
@@ -523,6 +524,23 @@ describe('concurrent sessions',()=>{
     // Single-terminal clients such as the phone redraw from the newly focused scrollback.
     expect(emitted.at(-1)).toMatchObject({type:'state',resetTerminal:true,state:{connection:{activeSessionId:first}}});
     expect(emitted.at(-1).state.terminalBuffer).toContain('background output');
+  });
+  it('records PTY resizes in the output stream so observers and replays switch size at the right byte',async()=>{
+    const {first}=await twoTabs();
+    const initial=controller!.getTerminalBuffer(first);
+    expect(initial.data.startsWith(terminalSizeMark(initial.cols!,initial.rows!)+READY)).toBe(true);
+    mocks.terminals[0].data('wide output');
+    emitted.length=0;
+    controller!.resizeTerminal(45,30,first);controller!.resizeTerminal(45,30,first);
+    mocks.terminals[0].data('narrow output');
+    const mark=terminalSizeMark(45,30),output=READY+'wide output'+mark+'narrow output';
+    expect(emitted.filter(event=>event.type!=='state')).toEqual([
+      {type:'terminal',data:mark,sessionId:first,generation:expect.any(Number),end:(READY+'wide output'+mark).length},
+      {type:'terminal-size',cols:45,rows:30,sessionId:first},
+      {type:'terminal',data:'narrow output',sessionId:first,generation:expect.any(Number),end:output.length},
+    ]);
+    expect(controller!.getTerminalBuffer(first)).toMatchObject({cols:45,rows:30,end:output.length});
+    expect(controller!.getTerminalBuffer(first).data.endsWith(output)).toBe(true);
   });
   it('closes one tab, focuses its neighbour and refuses to delete a session that is still open',async()=>{
     const {first,second}=await twoTabs();

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { AppState, HappyPandaAPI, SshAlias } from '../../shared/types';
 import { errorText, initialState, requireDesktop } from './api';
 import { isRemotePage } from './remote-client';
+import { appendTerminalOutput } from '../../shared/terminal';
 
 export interface Notice {
   id: number;
@@ -96,7 +97,7 @@ export function useAppState() {
       unsubscribe = api.onEvent((event) => {
         if (!alive) return;
         if (event.type === 'terminal') {
-          if (trackBuffer) bufferRef.current = (bufferRef.current + event.data).slice(-512000);
+          if (trackBuffer) bufferRef.current = appendTerminalOutput(bufferRef.current, event.data);
         } else if (event.type === 'terminal-size') {
           sizeRevisionRef.current += 1;
           terminalSizeRef.current = { cols: event.cols, rows: event.rows };

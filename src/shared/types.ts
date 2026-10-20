@@ -197,7 +197,7 @@ export interface HappyPandaAPI {
   reconnect(): Promise<void>;
   focusSession(sessionId: string): Promise<void>;
   closeSession(sessionId: string): Promise<void>;
-  getTerminalBuffer(sessionId: string): Promise<{ generation: number; data: string; end: number }>;
+  getTerminalBuffer(sessionId: string): Promise<{ generation: number; data: string; end: number; cols?: number; rows?: number }>;
   newSession(kind?: 'claude' | 'login' | 'shell'): Promise<void>;
   removeSession(id: string): Promise<void>;
   writeTerminal(data: string, sessionId?: string): void | Promise<void>;

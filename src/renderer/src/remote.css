@@ -92,6 +92,8 @@
 .terminal-view-fit .terminal-viewport { overflow: hidden; }
 .terminal-view-fit .terminal-host { overflow: hidden; transform-origin: top left; }
 .terminal-view-fit .terminal-host .xterm { min-height: 0; min-width: 0; }
+/* Vertical drags scroll the scrollback in script (terminal-touch-scroll.ts); horizontal pans stay native. */
+.remote-app .terminal-viewport { touch-action: pan-x; overscroll-behavior: contain; }
 
 .remote-compact-controls { min-width: 0; width: 100%; border-top: 1px solid #30343a; color: #dfe3e8; background: #202327; }
 .remote-compact-controls .icon-button { width: 32px; min-width: 32px; height: 32px; border-color: transparent; background: transparent; color: #aab3bd; }
