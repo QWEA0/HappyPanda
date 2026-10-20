@@ -11,18 +11,23 @@
   "scripts": {
     "dev": "node scripts/desktop.mjs dev",
     "start": "node scripts/desktop.mjs preview",
-    "build": "electron-vite build",
+    "build": "node scripts/build-ssh-helper.mjs && electron-vite build",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "pack": "node scripts/package.mjs pack",
+    "zip": "node scripts/package.mjs zip",
     "portable": "node scripts/package.mjs portable",
+    "smoke:startup": "node scripts/startup-smoke.mjs",
     "proof": "node research/verify-local-execution.mjs",
     "install:sync": "node scripts/install-mutagen.mjs",
     "smoke:remote": "tsx scripts/remote-smoke.ts",
     "smoke:providers": "tsx scripts/provider-smoke.ts",
     "smoke:login": "tsx scripts/login-browser-smoke.ts",
     "smoke:clipboard": "node scripts/clipboard-smoke.cjs",
-    "smoke:clipboard-copy": "node scripts/clipboard-copy-smoke.cjs"
+    "smoke:clipboard-copy": "node scripts/clipboard-copy-smoke.cjs",
+    "smoke:remote-control": "node scripts/remote-control-smoke.cjs",
+    "smoke:remote-control:package": "node scripts/remote-control-package-smoke.mjs",
+    "smoke:windows": "tsx scripts/windows-remote-smoke.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.32.1",
@@ -31,6 +36,7 @@
     "@xterm/xterm": "6.0.0",
     "lucide-react": "1.55.0",
     "node-pty": "1.1.0",
+    "qrcode": "1.5.4",
     "react": "19.3.0",
     "react-dom": "19.3.0",
     "ssh-config": "5.3.0",
@@ -38,6 +44,7 @@
   },
   "devDependencies": {
     "@types/node": "22.20.5",
+    "@types/qrcode": "1.5.6",
     "@types/react": "19.3.0",
     "@types/react-dom": "19.3.0",
     "@vitejs/plugin-react": "5.2.0",
@@ -67,7 +74,9 @@
           "bootstrap.py",
           "hp_remote.py",
           "import_memory.py",
-          "upload_image.py"
+          "upload_image.py",
+          "ssh-helper.cjs",
+          "windows-runtime.json.gz"
         ]
       },
       {
@@ -75,7 +84,8 @@
         "to": "tools",
         "filter": [
           "mutagen*",
-          "mutagen-install.json"
+          "mutagen-install.json",
+          "ssh-launcher.exe"
         ]
       }
     ],

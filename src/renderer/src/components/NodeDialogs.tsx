@@ -21,6 +21,8 @@ export function NodeDialog({ node, aliases, pending, run, loadAliases, onClose, 
   const [user, setUser] = useState(node?.user || '');
   const [port, setPort] = useState(node?.port?.toString() || '');
   const [identity, setIdentity] = useState(node?.identityFile || '');
+  const [authType, setAuthType] = useState<'key' | 'password'>(node?.authType || 'key');
+  const [password, setPassword] = useState('');
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [advanced, setAdvanced] = useState(Boolean(node?.user || node?.port || node?.identityFile));
   const busy = pending.has('save-node');
@@ -33,6 +35,7 @@ export function NodeDialog({ node, aliases, pending, run, loadAliases, onClose, 
     if (!target.trim()) nextErrors.target = '请输入 SSH 配置 alias 或主机地址。';
     else if (/\s/.test(target.trim()) || target.trim().startsWith('-')) nextErrors.target = 'SSH 目标不能包含空格或以短横线开头。';
     if (port.trim() && !validPort(port)) nextErrors.port = '端口必须是 1 到 65535 的整数。';
+    if (authType === 'password' && !password && !node?.hasPassword) nextErrors.password = '请输入 SSH 登录密码。';
     setErrors(nextErrors);
     if (nextErrors.port) setAdvanced(true);
     if (Object.keys(nextErrors).length) return;
@@ -43,6 +46,8 @@ export function NodeDialog({ node, aliases, pending, run, loadAliases, onClose, 
       user: user.trim() || undefined,
       port: port.trim() ? Number(port) : undefined,
       identityFile: identity.trim() || undefined,
+      authType,
+      password: authType === 'password' && password ? password : undefined,
     };
     const result = await run('save-node', '保存节点', (api) => api.saveNode(input), { success: '节点已保存' });
     if (result.ok) onClose();
@@ -68,6 +73,17 @@ export function NodeDialog({ node, aliases, pending, run, loadAliases, onClose, 
             placeholder="SSH 别名或 user@host" required aria-invalid={Boolean(errors.target)} aria-describedby={errors.target ? `${baseId}-target-error` : undefined} />
           {errors.target && <span className="field-error" id={`${baseId}-target-error`}>{errors.target}</span>}
         </div>
+        <div className="field"><label htmlFor={`${baseId}-auth`}>认证方式</label>
+          <select id={`${baseId}-auth`} value={authType} onChange={event => {setAuthType(event.target.value as 'key' | 'password');if(event.target.value==='password')setAdvanced(true);}}>
+            <option value="key">SSH 配置 / 密钥</option><option value="password">密码</option>
+          </select>
+        </div>
+        {authType === 'password' && <div className="field"><label htmlFor={`${baseId}-password`}>SSH 登录密码</label>
+          <input id={`${baseId}-password`} type="password" value={password} maxLength={1023} autoComplete="new-password" spellCheck={false}
+            onChange={event => {setPassword(event.target.value);setErrors(current => ({...current,password:''}));}}
+            placeholder={node?.hasPassword ? '留空保留已保存的密码' : '输入服务器登录密码'} aria-invalid={Boolean(errors.password)} />
+          {errors.password && <span className="field-error">{errors.password}</span>}
+        </div>}
         <details className="advanced-fields" open={advanced}>
           <summary onClick={(event) => { event.preventDefault(); setAdvanced((current) => !current); }}><ChevronDown size={14} aria-hidden="true" />高级设置</summary>
           <div className="form-fields">
@@ -78,8 +94,8 @@ export function NodeDialog({ node, aliases, pending, run, loadAliases, onClose, 
                 {errors.port && <span className="field-error" id={`${baseId}-port-error`}>{errors.port}</span>}
               </div>
             </div>
-            <div className="field"><label htmlFor={`${baseId}-identity`}>IdentityFile 路径覆盖</label><input id={`${baseId}-identity`} value={identity} onChange={(event) => setIdentity(event.target.value)}
-              className="mono" placeholder="使用 SSH 配置" autoComplete="off" spellCheck={false} /></div>
+            {authType === 'key' && <div className="field"><label htmlFor={`${baseId}-identity`}>IdentityFile 路径覆盖</label><input id={`${baseId}-identity`} value={identity} onChange={(event) => setIdentity(event.target.value)}
+              className="mono" placeholder="使用 SSH 配置" autoComplete="off" spellCheck={false} /></div>}
           </div>
         </details>
       </div>

@@ -18,10 +18,11 @@ root = os.path.normpath(root)
 if root == '/':
     raise ValueError('Filesystem root is not a workspace')
 def directories(directory, create=False):
-    current = '/'
-    for component in directory.strip('/').split('/'):
+    drive, tail = os.path.splitdrive(directory)
+    current = drive + os.sep
+    for component in tail.strip('/\\').replace('\\','/').split('/'):
         current = os.path.join(current, component)
-        if os.path.islink(current):
+        if os.path.islink(current) or getattr(os.path, 'isjunction', lambda p: False)(current):
             raise ValueError('Remote symbolic link is not allowed: ' + current)
         if os.path.lexists(current):
             if not os.path.isdir(current):
@@ -30,7 +31,7 @@ def directories(directory, create=False):
             os.mkdir(current, 0o700)
 def checked(relative, create=False):
     parts = relative.split('/')
-    if not relative or any(c in ('', '.', '..', '.git') for c in parts) or '\\' in relative:
+    if not relative or any((c.lower() if os.name == 'nt' else c) in ('', '.', '..', '.git') for c in parts) or '\\' in relative:
         raise ValueError('Path escapes remote workspace')
     target = os.path.join(root, *parts)
     if os.path.commonpath([root, target]) != root:
@@ -83,6 +84,10 @@ else:
         result = {'ok': True}
     else:
         raise ValueError('Unknown file operation')
+if isinstance(result.get('root'), str):
+    result['root'] = result['root'].replace(os.sep, '/')
+if isinstance(result.get('part'), str):
+    result['part'] = result['part'].replace(os.sep, '/')
 print(json.dumps(result))
 `;
 

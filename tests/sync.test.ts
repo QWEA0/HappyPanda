@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ServiceNode, Workspace } from '../src/shared/types';
-import { WorkspaceSync, SYNC_IGNORES, createSyncArguments } from '../src/main/sync';
+import { WorkspaceSync, MutagenCli, SYNC_IGNORES, createSyncArguments } from '../src/main/sync';
 import { checkedLocalPath, conflictRelativePath } from '../src/main/sync/paths';
 import { normalizeMutagenState, parseMutagenSessions, type MutagenSession } from '../src/main/sync/state';
 import { mutagenRemoteEndpoint, scpArguments, verifySystemIdentity, type CommandOptions } from '../src/main/sync/transport';
@@ -215,6 +215,18 @@ describe('sync args, isolation and session ownership', () => {
     const args = scpArguments({ ...node, identityFile: 'custom key' }, f.local, '/srv/file', 'upload', prepared);
     expect(args).toContain('-i'); expect(args).toContain('custom key');
   });
+  it('restarts only the isolated daemon before first use of the app transport', async () => {
+    const f = await fixture(false);
+    const sync = new WorkspaceSync({dataDir:path.join(f.directory,'app-transport'),onState:vi.fn(),runRemote:f.runRemote,
+      runCommand:f.runner,pollIntervalMs:0,restartDaemonOnTransportChange:true,
+      prepareSsh:async target=>({target:target.sshTarget,mutagenSshPath:path.join(f.directory,'ssh-transport'),managesIdentity:true})});
+    instances.push(sync);
+    await sync.ensure(f.workspace,node);await sync.status();await sync.flush();
+    expect(f.commands[0].args).toEqual(['daemon','stop']);
+    expect(f.commands[1].args[1]).toBe('list');
+    expect(f.commands.filter(command=>command.args[0]==='daemon')).toHaveLength(1);
+    await expect(verifySystemIdentity({...node,identityFile:'custom key'},f.runner,{target:node.sshTarget,managesIdentity:true})).resolves.toBeUndefined();
+  });
   it('pauses without destroying the session and does not flush a conflict', async () => {
     const f = await fixture();
     await f.sync.ensure(f.workspace, node);
@@ -275,5 +287,53 @@ describe('single-file conflict boundaries', () => {
     await mkdir(path.join(f.local, 'directory')); f.session.conflicts = [{ root: 'directory' }];
     await expect(f.sync.resolveConflict('directory', 'local')).rejects.toThrow('directories require manual');
     expect(f.commands.some(command => command.args[1] === 'pause')).toBe(false);
+  });
+});
+
+describe('shared Mutagen daemon client', () => {
+  const transport = (directory: string) => ({ target: node.sshTarget, mutagenSshPath: path.join(directory, 'ssh-transport'), managesIdentity: true });
+  it('treats a daemon that is not running as already stopped when restarting or shutting down', async () => {
+    const f = await fixture(false);
+    const runner = vi.fn(async (file: string, args: string[], options?: CommandOptions) => {
+      if (args[0] !== 'daemon') return f.runner(file, args, options);
+      f.commands.push({ file, args, options });
+      throw new Error('mutagen.exe failed (1): Error: unable to connect to daemon: connection timed out (is the daemon running?)');
+    });
+    const sync = new WorkspaceSync({ dataDir: path.join(f.directory, 'stopped-daemon'), onState: vi.fn(), runRemote: f.runRemote, runCommand: runner,
+      pollIntervalMs: 0, restartDaemonOnTransportChange: true, prepareSsh: async () => transport(f.directory) });
+    expect((await sync.ensure(f.workspace, node)).phase).toBe('ready');
+    await expect(sync.dispose()).resolves.toBeUndefined();
+    expect(f.commands.filter(command => command.args[0] === 'daemon')).toHaveLength(2);
+  });
+  it('still reports other failures to stop the daemon', async () => {
+    const f = await fixture(false);
+    const runner = vi.fn(async (file: string, args: string[], options?: CommandOptions) => {
+      if (args[0] === 'daemon') throw new Error('mutagen.exe failed (1): Error: access is denied');
+      return f.runner(file, args, options);
+    });
+    const sync = new WorkspaceSync({ dataDir: path.join(f.directory, 'denied'), onState: vi.fn(), runRemote: f.runRemote, runCommand: runner,
+      pollIntervalMs: 0, restartDaemonOnTransportChange: true, prepareSsh: async () => transport(f.directory) });
+    const state = await sync.ensure(f.workspace, node);
+    expect(state.phase).toBe('error'); expect(state.message).toContain('access is denied');
+  });
+  it('shares one transport restart and coalesces polling reads across workspaces, leaving the daemon to its owner', async () => {
+    const f = await fixture();
+    const cli = new MutagenCli({ dataDir: path.join(f.directory, 'shared'), runCommand: f.runner, restartDaemonOnTransportChange: true });
+    const connection = transport(f.directory);
+    await Promise.all([cli.run(['sync', 'pause', 'a'], connection), cli.run(['sync', 'pause', 'b'], connection)]);
+    expect(f.commands.filter(command => command.args[0] === 'daemon')).toHaveLength(1);
+    const lists = () => f.commands.filter(command => command.args[1] === 'list').length;
+    const [first, second] = await Promise.all([cli.pollList(connection), cli.pollList(connection)]);
+    expect(first).toBe(second); expect(lists()).toBe(1);
+    await cli.pollList(connection); expect(lists()).toBe(1);
+    await cli.run(['sync', 'resume', 'a'], connection);
+    await cli.pollList(connection); expect(lists()).toBe(2);
+    const sync = new WorkspaceSync({ dataDir: path.join(f.directory, 'shared'), onState: vi.fn(), runRemote: f.runRemote, runCommand: f.runner, pollIntervalMs: 0, cli });
+    expect((await sync.ensure(f.workspace, node)).phase).toBe('ready');
+    await sync.dispose();
+    expect(f.commands.filter(command => command.args[0] === 'daemon')).toHaveLength(1);
+    await cli.stopDaemon();
+    expect(f.commands.at(-1)?.args).toEqual(['daemon', 'stop']);
+    expect(f.commands.at(-1)?.options?.env?.MUTAGEN_SSH_PATH).toBe(connection.mutagenSshPath);
   });
 });

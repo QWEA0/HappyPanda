@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { Check, Folder, FolderOpen, Laptop, Server } from 'lucide-react';
-import type { ServiceNode, SyncConflict, Workspace } from '../../../shared/types';
+import type { ServiceNode, SyncConflict, Workspace, WorkspaceMode } from '../../../shared/types';
 import type { RunAction } from '../useAppState';
 import { Modal, SubmitButton, type DialogFeedback } from './ui';
 
@@ -8,8 +8,17 @@ export function WorkspaceDialog({ node, workspaces, activeId, pending, run, onCo
   node: ServiceNode; workspaces: Workspace[]; activeId?: string; pending: Set<string>; run: RunAction;
   onConnect: (node: ServiceNode, workspaceId: string) => void; onClose: () => void;
 }) {
+  const [mode,setMode]=useState<WorkspaceMode>(workspaces.find(workspace=>workspace.id===activeId)?.mode??'mcp-only');
+  const busy=pending.has('connect')||pending.has('choose-workspace')||pending.has('workspace-mode');
+  const connectExisting=async(workspace:Workspace)=>{
+    if((workspace.mode??'sync')!==mode){
+      const result=await run('workspace-mode','设置工作区模式',api=>api.setWorkspaceMode(workspace.id,mode));
+      if(!result.ok)return;
+    }
+    onClose();onConnect(node,workspace.id);
+  };
   const chooseNew = async () => {
-    const result = await run('choose-workspace', '选择本地目录', (api) => api.chooseWorkspace(node.id));
+    const result = await run('choose-workspace', '选择本地目录', (api) => api.chooseWorkspace(node.id,mode));
     if (result.ok && result.value) {
       onClose();
       onConnect(node, result.value.id);
@@ -19,14 +28,18 @@ export function WorkspaceDialog({ node, workspaces, activeId, pending, run, onCo
   return <Modal title="选择工作区" onClose={onClose} {...feedback}>
     <div className="dialog-body workspace-picker">
       <div className="dialog-context"><Server size={15} aria-hidden="true" /><span>{node.name}</span></div>
+      <div className="field workspace-mode-field"><label htmlFor="workspace-connect-mode">连接模式</label>
+        <select id="workspace-connect-mode" value={mode} disabled={busy} onChange={event=>setMode(event.target.value as WorkspaceMode)}>
+          <option value="mcp-only">仅本机 MCP</option><option value="sync">双向同步</option>
+        </select></div>
       {available.length ? <ul className="workspace-list">{available.map((workspace) => <li key={workspace.id}>
-        <button className="workspace-option" disabled={pending.has('connect') || pending.has('choose-workspace')} onClick={() => { onClose(); onConnect(node, workspace.id); }}>
+        <button className="workspace-option" disabled={busy} onClick={() => { void connectExisting(workspace); }}>
           <Folder size={18} aria-hidden="true" /><span className="option-text"><strong>{workspace.name}</strong><span className="muted mono" title={workspace.localPath}>{workspace.localPath}</span></span>
           {workspace.id === activeId && <Check size={16} className="success-text" aria-label="当前工作区" />}
         </button></li>)}</ul> : <p className="empty-inline">尚未保存工作区</p>}
     </div>
     <footer className="dialog-footer"><button className="button" onClick={onClose}>取消</button>
-      <button className="button primary" disabled={pending.has('choose-workspace')} aria-busy={pending.has('choose-workspace')} onClick={() => { void chooseNew(); }}>
+      <button className="button primary" disabled={busy} aria-busy={pending.has('choose-workspace')} onClick={() => { void chooseNew(); }}>
         <FolderOpen size={15} aria-hidden="true" />{pending.has('choose-workspace') ? '正在选择…' : '选择本地目录'}</button></footer>
   </Modal>;
 }

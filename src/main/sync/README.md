@@ -26,7 +26,11 @@ and overlapping staging that does not match the commit remain pending for review
 
 `ensure` reuses sessions only when their name, endpoint orientation, paths,
 SSH settings, mode and exclusions match. Mismatches return an error state and
-preserve the session. Switching workspaces pauses the previous session.
+preserve the session. One WorkspaceSync manages one workspace. The desktop
+creates one per workspace that has an open session, so several workspaces
+synchronize at the same time; a workspace's session is paused only after its
+last open tab closes. Within one instance, switching workspaces still pauses the
+previous session.
 `status` uses the official `sync list --template '{{ json . }}'` schema; scan,
 write, connection and root-halt errors cannot become ready. `flush` returns the
 observed state; main must require ready before starting dependent commands.
@@ -40,20 +44,29 @@ isolated daemon, preserving session definitions.
 
 Connections can use a user-configured system OpenSSH alias. Explicit user
 and port use Mutagen's supported `[user@]host:[port:]path` syntax. An explicit
-identity must already resolve through system SSH configuration (`ssh -G`),
-otherwise ensure returns a clear error. No private key is read. `prepareSsh`
-does not bypass this explicit identity check; selecting a system binary
-directory alone does not configure an IdentityFile. Every CLI call uses the
-prepared directory, including the first list that can launch the daemon.
-An already running daemon inherits its transport environment at startup;
-main must restart its isolated daemon when changing the transport directory.
-`prepareSsh`
-is an optional future integration hook: its alias/transport must implement all
-requested node settings. `mutagenSshPath` is a directory containing real SSH
-and SCP executables; a bare config filename or `-F` argument is insufficient.
-No Windows executable wrapper is supplied. IPv6 endpoints require an SSH alias.
+identity must resolve through system SSH configuration (`ssh -G`) unless
+`prepareSsh` supplies a transport with `managesIdentity`. The desktop supplies
+an SSH/SCP wrapper that applies IdentityFile overrides and password authentication
+through system OpenSSH. It never reads private keys. Passwords remain encrypted
+in the inventory; the askpass helper obtains them from a token-protected loopback
+service without putting them in process arguments or environment variables.
+Every CLI call uses the prepared executable directory, including the first list
+that can launch the daemon. The desktop restarts only its isolated daemon before
+first use of this transport so an older daemon cannot retain the previous
+environment. Session definitions are preserved. `daemon stop` exits 1 with
+"unable to connect to daemon" when no daemon is running; that case counts as
+already stopped, both for this restart and at shutdown. Other stop failures are
+reported. A custom prepared system binary
+directory alone does not bypass the IdentityFile check. IPv6 endpoints require
+an SSH alias. Host keys must already be trusted by system OpenSSH.
 
-Remote roots are absolute POSIX paths; literal `$HOME/` and `~/` prefixes are
+Remote roots are absolute POSIX paths or normalized Windows drive paths such as
+`C:/Users/user/project`; native Windows nodes use the bundled agent for their
+architecture. The app verifies and uploads that agent to its own user directory,
+then launches it with native Windows arguments, avoiding locale-dependent shell
+errors during agent discovery. The SSH wrapper also launches the absolute native
+SFTP server path when the server PATH cannot resolve its configured subsystem.
+Literal `$HOME/` and `~/` prefixes are
 resolved remotely without interpolating user input in the shell. Remote path
 checks and conflict verification require Python 3 on the node. CLI/SCP calls
 use argv and do not use a local shell. Default SCP requires modern OpenSSH's
@@ -76,6 +89,13 @@ if a release publishes no digest at all, its JSON result explicitly reports
 
 ## Performance behavior
 
+- `MutagenCli` (`mutagen.ts`) is the shared daemon client. Pass it as `cli` to
+  let several `WorkspaceSync` instances share binary discovery, the one-time
+  transport restart and polling reads; the owner then calls `stopDaemon()`.
+  Without `cli` an instance creates and owns its own client, as before.
+- Background status polls from several workspaces share one `sync list` for up
+  to 1.5 s. A shared result is discarded if any pause/resume/create/flush started
+  or finished while it was in flight. Reads that follow a mutation never share.
 - `ensure(workspace, node, { reuse: true })` reuses a session prepared earlier in
   the same run (up to `reuseMaxAgeMs`, default 10 minutes) after verifying it still
   exists and matches; it skips the remote setup call and Git ignore recomputation.

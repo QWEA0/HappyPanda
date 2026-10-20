@@ -15,5 +15,7 @@ if(!existsSync(join(electronDirectory,'path.txt'))){
   const code=await run([join(electronDirectory,'install.js')]);
   if(code!==0)process.exit(code);
 }
+const helperCode=await run([join(root,'scripts','build-ssh-helper.mjs')]);
+if(helperCode!==0)process.exit(helperCode);
 const code=await run([join(root,'node_modules','electron-vite','bin','electron-vite.js'),process.argv[2]??'dev']);
 process.exitCode=code;

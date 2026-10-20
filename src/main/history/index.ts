@@ -131,7 +131,7 @@ export class HistoryImporter {
       const workspaceKey = createHash('sha256').update(`${node.id}\0${workspace.id}`).digest('hex').slice(0, 32);
       const context = { workspaceKey, manifestHash: digest };
       const archive = await archiveOperation<{ root: string }>(this.options.runRemote, node, { ...context, action: 'init' });
-      if (!archive.root.startsWith('/') || archive.root.includes('\\') || !archive.root.endsWith(`/history/${workspaceKey}/${digest}`)) throw new Error('Remote archive returned an invalid app-owned root');
+      if ((!archive.root.startsWith('/')&&!/^[A-Za-z]:\//.test(archive.root)) || archive.root.includes('\\') || !archive.root.endsWith(`/history/${workspaceKey}/${digest}`)) throw new Error('Remote archive returned an invalid app-owned root');
       const prepared = this.options.uploadFile ? undefined : await this.options.prepareSsh?.(node);
       const upload: FileTransfer = this.options.uploadFile ?? ((target, local, remote) => scpTransfer(target, local, remote, 'upload', undefined, prepared));
       const result: ImportResult = { imported: 0, bytes: 0, remotePaths: [], warnings: [...new Set(warnings)] };

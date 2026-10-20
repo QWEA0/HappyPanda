@@ -1,5 +1,8 @@
+import type { DesktopRemoteControlAPI } from './remote';
+
 export type ConnectionPhase = 'disconnected' | 'preparing' | 'connecting' | 'connected' | 'retrying' | 'failed';
 export type SyncPhase = 'none' | 'preparing' | 'scanning' | 'syncing' | 'ready' | 'conflict' | 'paused' | 'disconnected' | 'error';
+export type WorkspaceMode = 'sync' | 'mcp-only';
 
 export interface ServiceNode {
   id: string;
@@ -8,6 +11,8 @@ export interface ServiceNode {
   user?: string;
   port?: number;
   identityFile?: string;
+  authType?: 'key' | 'password';
+  hasPassword?: boolean;
   lastWorkspaceId?: string;
   lastSessionId?: string;
   providerId?: string;
@@ -21,6 +26,7 @@ export interface Workspace {
   localPath: string;
   remotePath: string;
   localAccess: boolean;
+  mode?: WorkspaceMode;
   syncSessionName: string;
   syncGitIgnores?: string[];
   createdAt: string;
@@ -80,6 +86,18 @@ export interface ConnectionState {
   activeWorkspaceId?: string;
   activeSessionId?: string;
 }
+/** A session with a live terminal. Several can run at once; connection describes the focused one. */
+export interface OpenSessionState {
+  sessionId: string;
+  nodeId: string;
+  workspaceId?: string;
+  title: string;
+  kind: SessionInfo['kind'];
+  phase: ConnectionPhase;
+  message: string;
+  generation: number;
+  unread: boolean;
+}
 export interface AppState {
   workspacePreparation?: {workspaceId:string;phase:'syncing'|'git'|'ready'|'error';message:string};
   browserLogin?: BrowserLoginState;
@@ -92,6 +110,9 @@ export interface AppState {
   sync: SyncState;
   activities: ActivityEvent[];
   terminalBuffer: string;
+  terminalSize?: { cols: number; rows: number };
+  terminalGeneration?: number;
+  openSessions?: OpenSessionState[];
   version: string;
   portForwards?: PortForward[];
 }
@@ -128,6 +149,8 @@ export interface NodeInput {
   user?: string;
   port?: number;
   identityFile?: string;
+  authType?: 'key' | 'password';
+  password?: string;
 }
 export interface SshAlias { name: string; hostname?: string; user?: string; port?: number }
 export interface LocalHistoryProject {
@@ -149,15 +172,17 @@ export interface ImportResult { imported: number; bytes: number; remotePaths: st
 export interface MemoryImportResult {sourcePath:string;destinationPath:string;totalFiles:number;bytes:number;imported:number;unchanged:number;conflicts:string[]}
 export interface ImportRequest { workspaceId: string; sessionPaths: string[] }
 export interface PortForward { id: string; localPort: number; remotePort: number; nodeId: string }
-export interface TerminalPasteRequest {nodeId:string;sessionId:string;bracketedPaste:boolean}
+export interface TerminalPasteRequest {nodeId:string;sessionId:string;bracketedPaste:boolean;generation?:number}
 export interface TerminalPasteResult {kind:'image'|'text'|'empty'}
 
 export type AppEvent =
-  | { type: 'state'; state: AppState }
-  | { type: 'terminal'; data: string }
+  | { type: 'state'; state: AppState; resetTerminal?: boolean }
+  | { type: 'terminal'; data: string; sessionId?: string; generation?: number; end?: number }
+  | { type: 'terminal-size'; cols: number; rows: number; sessionId?: string }
   | { type: 'activity'; activity: ActivityEvent };
 
 export interface HappyPandaAPI {
+  remoteControl?: DesktopRemoteControlAPI;
   getState(): Promise<AppState>;
   saveProvider(input: ProviderInput): Promise<ApiProvider>;
   removeProvider(id: string): Promise<void>;
@@ -165,15 +190,20 @@ export interface HappyPandaAPI {
   listSshAliases(): Promise<SshAlias[]>;
   saveNode(input: NodeInput): Promise<ServiceNode>;
   removeNode(id: string): Promise<void>;
-  chooseWorkspace(nodeId: string): Promise<Workspace | null>;
+  chooseWorkspace(nodeId: string, mode?: WorkspaceMode): Promise<Workspace | null>;
+  setWorkspaceMode(workspaceId: string, mode: WorkspaceMode): Promise<void>;
   connect(nodeId: string, workspaceId?: string, sessionId?: string): Promise<void>;
   disconnect(): Promise<void>;
+  reconnect(): Promise<void>;
+  focusSession(sessionId: string): Promise<void>;
+  closeSession(sessionId: string): Promise<void>;
+  getTerminalBuffer(sessionId: string): Promise<{ generation: number; data: string; end: number }>;
   newSession(kind?: 'claude' | 'login' | 'shell'): Promise<void>;
   removeSession(id: string): Promise<void>;
-  writeTerminal(data: string): void;
+  writeTerminal(data: string, sessionId?: string): void | Promise<void>;
   copyText(text: string): Promise<void>;
   pasteClipboard(request:TerminalPasteRequest):Promise<TerminalPasteResult>;
-  resizeTerminal(cols: number, rows: number): void;
+  resizeTerminal(cols: number, rows: number, sessionId?: string): void | Promise<void>;
   setLocalAccess(workspaceId: string, enabled: boolean): Promise<void>;
   syncNow(): Promise<SyncState>;
   pauseSync(): Promise<void>;

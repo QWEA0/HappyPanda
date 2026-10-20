@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { AppState, HappyPandaAPI, SshAlias } from '../../shared/types';
 import { errorText, initialState, requireDesktop } from './api';
+import { isRemotePage } from './remote-client';
 
 export interface Notice {
   id: number;
@@ -25,11 +26,15 @@ export function useAppState() {
   const [pending, setPending] = useState<Set<string>>(new Set());
   const pendingRef = useRef(new Set<string>());
   const revisionRef = useRef(0);
+  const sizeRevisionRef = useRef(0);
+  const terminalSizeRef = useRef<AppState['terminalSize']>(undefined);
   const mountedRef = useRef(true);
   const noticeId = useRef(0);
   // Main sends scrollback only via getState; between those, rebuild it from terminal events.
   const bufferRef = useRef('');
   const contextRef = useRef('');
+  // Desktop tabs fetch scrollback per session; only the phone's single mirrored terminal reads state.terminalBuffer.
+  const trackBuffer = useRef(isRemotePage()).current;
 
   const notify = useCallback((kind: Notice['kind'], title: string, detail?: string) => {
     if (mountedRef.current) setNotice({ id: ++noticeId.current, kind, title, detail });
@@ -37,11 +42,14 @@ export function useAppState() {
 
   const refresh = useCallback(async (api: HappyPandaAPI) => {
     const revision = revisionRef.current;
+    const sizeRevision = sizeRevisionRef.current;
     const next = await api.getState();
     if (mountedRef.current && revision === revisionRef.current) {
       bufferRef.current = next.terminalBuffer;
       contextRef.current = `${next.connection.activeNodeId || ''}/${next.connection.activeSessionId || ''}`;
-      setState(next);
+      const terminalSize = sizeRevision === sizeRevisionRef.current ? next.terminalSize : terminalSizeRef.current;
+      terminalSizeRef.current = terminalSize;
+      setState({ ...next, terminalSize });
     }
   }, []);
 
@@ -88,11 +96,16 @@ export function useAppState() {
       unsubscribe = api.onEvent((event) => {
         if (!alive) return;
         if (event.type === 'terminal') {
-          bufferRef.current = (bufferRef.current + event.data).slice(-512000);
+          if (trackBuffer) bufferRef.current = (bufferRef.current + event.data).slice(-512000);
+        } else if (event.type === 'terminal-size') {
+          sizeRevisionRef.current += 1;
+          terminalSizeRef.current = { cols: event.cols, rows: event.rows };
+          setState(previous => ({ ...previous, terminalSize: { cols: event.cols, rows: event.rows } }));
         } else if (event.type === 'state') {
           revisionRef.current += 1;
+          terminalSizeRef.current = event.state.terminalSize;
           const context = `${event.state.connection.activeNodeId || ''}/${event.state.connection.activeSessionId || ''}`;
-          if (context !== contextRef.current) { contextRef.current = context; bufferRef.current = ''; }
+          if (context !== contextRef.current || event.resetTerminal) { contextRef.current = context; bufferRef.current = event.state.terminalBuffer; }
           setState({ ...event.state, terminalBuffer: bufferRef.current });
         } else if (event.type === 'activity') {
           setState((previous) => ({

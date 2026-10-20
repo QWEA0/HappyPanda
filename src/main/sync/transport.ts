@@ -2,6 +2,8 @@ import { spawn } from 'node:child_process';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import type { ServiceNode } from '../../shared/types';
+import { authenticationArgs, sshEnvironment,sshTransportDirectory } from '../ssh-auth';
+import {isWindowsRemote} from '../remote-platform';
 
 export interface CommandOptions {
   env?: NodeJS.ProcessEnv;
@@ -23,6 +25,7 @@ export interface SshPreparation {
   mutagenSshPath?: string;
   scpPath?: string;
   scpArgs?: string[];
+  managesIdentity?: boolean;
 }
 export type PrepareSsh = (node: ServiceNode) => Promise<SshPreparation>;
 
@@ -77,6 +80,12 @@ export function sshAddress(node: ServiceNode | SshPreparation): { host: string; 
 }
 
 export function remoteRoot(value: string): string {
+  if (/^[A-Za-z]:\//.test(value) && !/[\\\0\r\n]/.test(value)) {
+    if(value.split('/').some(segment=>['..','.git'].includes(segment.toLowerCase())))throw new Error('Invalid Windows workspace path');
+    const root=path.win32.normalize(value).replaceAll('\\','/').replace(/\/$/,'');
+    if(/^[A-Za-z]:$/.test(root))throw new Error('Filesystem root is not a workspace');
+    return root;
+  }
   if (!value.startsWith('/') || value.includes('\\') || /[\0\r\n]/.test(value) || value.split('/').includes('..')) {
     throw new Error('Remote workspace must be an absolute POSIX path');
   }
@@ -93,11 +102,12 @@ export function mutagenRemoteEndpoint(connection: ServiceNode | SshPreparation, 
 export function scpArguments(node: ServiceNode, localFile: string, remoteFile: string, direction: 'upload' | 'download', prepared?: SshPreparation): string[] {
   const { host, user, port } = sshAddress(prepared ?? node);
   if (!path.isAbsolute(localFile)) throw new Error('SCP local path must be absolute');
-  if (!remoteFile.startsWith('/') || /[\0\r\n]/.test(remoteFile)) throw new Error('SCP remote path must be absolute');
-  const args = ['-B', '-o', 'ConnectTimeout=15', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=3'];
+  if ((!remoteFile.startsWith('/')&&!/^[A-Za-z]:\//.test(remoteFile)) || /[\0\r\n]/.test(remoteFile)) throw new Error('SCP remote path must be absolute');
+  const args = [...authenticationArgs(node), '-o', 'StrictHostKeyChecking=yes', '-o', 'ConnectTimeout=15', '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=3'];
+  const transport=sshTransportDirectory(node);if(isWindowsRemote(node)&&transport)args.push('-S',path.join(transport,process.platform==='win32'?'ssh.exe':'ssh'));
   if (prepared?.scpArgs) args.push(...prepared.scpArgs);
   if (port) args.push('-P', String(port));
-  if (node.identityFile) args.push('-i', node.identityFile);
+  if (node.identityFile && node.authType !== 'password') args.push('-i', node.identityFile);
   const remote = `${user ? `${user}@` : ''}${host}:${remoteFile}`;
   args.push('--', ...(direction === 'upload' ? [localFile, remote] : [remote, localFile]));
   return args;
@@ -105,11 +115,11 @@ export function scpArguments(node: ServiceNode, localFile: string, remoteFile: s
 
 export async function scpTransfer(node: ServiceNode, localFile: string, remoteFile: string, direction: 'upload' | 'download', runner: CommandRunner = runCommand, prepared?: SshPreparation): Promise<void> {
   const executable = prepared?.scpPath ?? (prepared?.mutagenSshPath ? path.join(prepared.mutagenSshPath, process.platform === 'win32' ? 'scp.exe' : 'scp') : 'scp');
-  await runner(executable, scpArguments(node, localFile, remoteFile, direction, prepared), { timeoutMs: 60 * 60_000 });
+  await runner(executable, scpArguments(node, localFile, remoteFile, direction, prepared), { timeoutMs: 60 * 60_000, env:sshEnvironment(node) });
 }
 
 export async function verifySystemIdentity(node: ServiceNode, runner: CommandRunner, prepared?: SshPreparation): Promise<void> {
-  if (!node.identityFile) return;
+  if (!node.identityFile || node.authType === 'password' || prepared?.managesIdentity) return;
   const { host, user, port } = sshAddress(prepared ?? node);
   const args = ['-G'];
   if (user) args.push('-l', user);

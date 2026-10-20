@@ -8,6 +8,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { BrowserLoginState, ServiceNode } from '../shared/types';
 import { sshArgs, sshExecutable } from './ssh';
+import { sshEnvironment } from './ssh-auth';
 import type { LoginNetworkCheck } from './login-network';
 
 const authorizationHosts = new Set(['claude.com', 'claude.ai', 'console.anthropic.com', 'platform.claude.com']);
@@ -253,7 +254,7 @@ export class BrowserLoginManager {
       if (generation !== this.generation) throw new Error('登录已取消。');
       const args = [...sshArgs(node), '-S', 'none', '-v', '-o', 'ExitOnForwardFailure=yes', '-N',
         '-D', `127.0.0.1:${upstream}`, '-R', `127.0.0.1:0:127.0.0.1:${proofPort}`, node.sshTarget];
-      const ssh = this.spawnProcess(sshExecutable(), args, { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] });
+      const ssh = this.spawnProcess(sshExecutable(), args, { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'], env:sshEnvironment(node) });
       route.ssh = ssh;
       ownedSsh = ssh;
       const remotePort = await new Promise<number>((resolve, reject) => {

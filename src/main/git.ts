@@ -5,6 +5,8 @@ import { existsSync } from 'node:fs';
 import type { ServiceNode,Workspace } from '../shared/types';
 import { runProcess,runRemote,uploadFile,downloadFile,shellQuote } from './ssh';
 import { runCommand } from './sync/transport';
+import {isWindowsRemote} from './remote-platform';
+import {windowsGit} from './windows-git';
 
 export interface GitSyncResult {
   phase:'ready'|'blocked';
@@ -26,7 +28,8 @@ export class GitWorkspace {
     const eol=configuredEol==='native'?(process.platform==='win32'?'crlf':'lf'):configuredEol;
     if(!mode||!crlf||!['lf','crlf'].includes(eol))throw new Error('Unsupported local Git comparison settings');
     const root=shellQuote(workspace.remotePath);
-    await runRemote(node,'git -C '+root+' config --local core.filemode '+mode+' && git -C '+root+' config --local core.autocrlf '+crlf+' && git -C '+root+' config --local core.eol '+eol);
+    if(isWindowsRemote(node))await windowsGit(node,workspace.remotePath,'settings',{settings:{'core.filemode':mode,'core.autocrlf':crlf,'core.eol':eol}});
+    else await runRemote(node,'git -C '+root+' config --local core.filemode '+mode+' && git -C '+root+' config --local core.autocrlf '+crlf+' && git -C '+root+' config --local core.eol '+eol);
   }
   private async localHead(workspace:Workspace){
     try{
@@ -39,24 +42,25 @@ export class GitWorkspace {
   }
   async bootstrap(workspace:Workspace,node:ServiceNode):Promise<boolean>{
     const head=await this.localHead(workspace);if(!head)return false;
-    const existing=await runRemote(node,'if test -d '+shellQuote(workspace.remotePath+'/.git')+' && git -C '+shellQuote(workspace.remotePath)+' rev-parse --verify HEAD >/dev/null 2>&1; then printf existing; fi');
+    const existing=isWindowsRemote(node)?await windowsGit(node,workspace.remotePath,'existing'):await runRemote(node,'if test -d '+shellQuote(workspace.remotePath+'/.git')+' && git -C '+shellQuote(workspace.remotePath)+' rev-parse --verify HEAD >/dev/null 2>&1; then printf existing; fi');
     if(existing.trim()==='existing'){await this.alignComparisonSettings(workspace,node);return false;}
     const directory=join(this.dataDir,'git',workspace.id);await mkdir(directory,{recursive:true});
     const bundle=join(directory,'baseline.bundle');
     await runProcess('git',['-C',workspace.localPath,'bundle','create',bundle,'HEAD'],undefined,180000);
     const remoteBundle=workspace.remotePath+'/.happypanda-sync-baseline.bundle';
     await uploadFile(node,bundle,remoteBundle,15*60_000);
-    await runRemote(node,'git -C '+shellQuote(workspace.remotePath)+' init -q && git -C '+shellQuote(workspace.remotePath)+' fetch -q '+shellQuote(remoteBundle)+' HEAD:refs/heads/workspace && git -C '+shellQuote(workspace.remotePath)+' symbolic-ref HEAD refs/heads/workspace && git -C '+shellQuote(workspace.remotePath)+' reset --mixed -q '+shellQuote(head)+' && rm -f -- '+shellQuote(remoteBundle));
+    if(isWindowsRemote(node))await windowsGit(node,workspace.remotePath,'bootstrap',{bundle:remoteBundle,head});
+    else await runRemote(node,'git -C '+shellQuote(workspace.remotePath)+' init -q && git -C '+shellQuote(workspace.remotePath)+' fetch -q '+shellQuote(remoteBundle)+' HEAD:refs/heads/workspace && git -C '+shellQuote(workspace.remotePath)+' symbolic-ref HEAD refs/heads/workspace && git -C '+shellQuote(workspace.remotePath)+' reset --mixed -q '+shellQuote(head)+' && rm -f -- '+shellQuote(remoteBundle));
     await this.alignComparisonSettings(workspace,node);
     for(const key of ['user.name','user.email']){
-      try{const value=(await runProcess('git',['-C',workspace.localPath,'config','--get',key])).trim();if(value&&!/[\r\n\0]/.test(value))await runRemote(node,'git -C '+shellQuote(workspace.remotePath)+' config '+key+' '+shellQuote(value));}catch{}
+      try{const value=(await runProcess('git',['-C',workspace.localPath,'config','--get',key])).trim();if(value&&!/[\r\n\0]/.test(value)){if(isWindowsRemote(node))await windowsGit(node,workspace.remotePath,'settings',{settings:{[key]:value}});else await runRemote(node,'git -C '+shellQuote(workspace.remotePath)+' config '+key+' '+shellQuote(value));}}catch{}
     }
     return true;
   }
   async fetchRemoteCommits(workspace:Workspace,node:ServiceNode):Promise<string|null>{
     const localHead=await this.localHead(workspace);if(!localHead)return null;
     const root=shellQuote(workspace.remotePath);
-    const remoteHead=(await runRemote(node,'git -C '+root+' rev-parse --verify HEAD')).trim();
+    const remoteHead=(isWindowsRemote(node)?await windowsGit(node,workspace.remotePath,'git',{args:['rev-parse','--verify','HEAD']}):await runRemote(node,'git -C '+root+' rev-parse --verify HEAD')).trim();
     if(!/^[a-f0-9]{40,64}$/.test(remoteHead))throw new Error('Invalid remote Git HEAD');
     if(remoteHead===localHead)return null;
     const reference='refs/remotes/happypanda/'+workspace.id;
@@ -72,13 +76,15 @@ export class GitWorkspace {
     const bundle=join(directory,'remote-'+id+'.bundle');
     try{
       // Transfer only new objects when both repositories share the local baseline.
-      await runRemote(node,'if git -C '+root+' cat-file -e '+shellQuote(localHead+'^{commit}')+' 2>/dev/null; then git -C '+root+' bundle create '+shellQuote(remoteBundle)+' HEAD '+shellQuote('^'+localHead)+'; else git -C '+root+' bundle create '+shellQuote(remoteBundle)+' HEAD; fi',undefined,180000);
+      if(isWindowsRemote(node))await windowsGit(node,workspace.remotePath,'bundle',{bundle:remoteBundle,head:localHead},180000);
+      else await runRemote(node,'if git -C '+root+' cat-file -e '+shellQuote(localHead+'^{commit}')+' 2>/dev/null; then git -C '+root+' bundle create '+shellQuote(remoteBundle)+' HEAD '+shellQuote('^'+localHead)+'; else git -C '+root+' bundle create '+shellQuote(remoteBundle)+' HEAD; fi',undefined,180000);
       await downloadFile(node,bundle,remoteBundle);
       await runProcess('git',['-C',workspace.localPath,'fetch','--no-tags',bundle,'+HEAD:'+reference],undefined,180000);
       return reference;
     }finally{
       await rm(bundle,{force:true});
-      await runRemote(node,'rm -f -- '+shellQuote(remoteBundle));
+      if(isWindowsRemote(node))await windowsGit(node,workspace.remotePath,'remove',{bundle:remoteBundle});
+      else await runRemote(node,'rm -f -- '+shellQuote(remoteBundle));
     }
   }
   async syncRemoteCommits(workspace:Workspace,node:ServiceNode,current:()=>boolean=()=>true):Promise<GitSyncResult>{

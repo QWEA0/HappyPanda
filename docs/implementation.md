@@ -66,6 +66,12 @@ SSH connections, server metrics, or Claude conversations.
 
 ## Terminal copy and clipboard image paste
 
+Android browser remote control shares the PC controller through its own paired
+HTTP/SSE service. The PC continues to own SSH, synchronization and loopback MCP.
+See [Android remote control](remote-control.md) for setup, control ownership,
+background lifetime, desktop-only operations and validation.
+
+
 Terminal selection copy uses the typed preload IPC and Electron's native
 `clipboard.writeText` in the main process, with the same trusted-frame validation
 as other application IPC. This avoids renderer clipboard focus requirements.
@@ -394,3 +400,29 @@ synchronization/tmux sessions, performs real
 operations, attempts cleanup, and records its result in
 `.local/remote-smoke-result.json`. Individual recorded probes and a full
 passing regression run are separate acceptance results.
+
+## Native Windows Remote Nodes
+
+Windows nodes use the existing Windows OpenSSH account and port. The client
+detects the remote operating system and locates a real Python executable instead
+of the Microsoft Store `python3` alias. Management requests travel through a
+persistent Python channel; long programs and input are streamed over SSH stdin
+instead of the Windows command line. Native Claude installations and npm package
+`bin` metadata are supported.
+
+A small node-pty ConPTY supervisor replaces tmux on Windows. Its process explicitly
+breaks away from the SSH job so disconnecting does not terminate the terminal.
+Authenticated loopback attachments replay output and forward input and resizing.
+Provider changes and explicit reloads restart the CLI with saved conversation
+state. Server metrics use Windows APIs. Files, history archives, conflict paths,
+and Git transfers accept normalized drive paths. Synchronization launches a
+verified bundled Windows agent directly; SFTP uses an absolute executable path
+when the server PATH cannot resolve its configured subsystem. These components
+live in the user's application namespace without changing global SSH settings.
+
+`npm run smoke:windows -- <saved-node-id>` uses the running desktop's credential
+broker and creates isolated managed test directories. It verifies native terminal
+state across reconnects, resizing, SCP, two-way synchronization, Git baseline and
+commit return, Windows metrics, and the installed Claude interface without
+submitting a conversation. Reports remain in `.local/`; browser OAuth completion
+and paid model execution require separate verification.

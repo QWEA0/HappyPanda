@@ -21,7 +21,7 @@ def directories(directory):
         if component in ('', '.', '..'):
             raise ValueError('Invalid archive directory')
         current = os.path.join(current, component)
-        if os.path.islink(current):
+        if os.path.islink(current) or getattr(os.path, 'isjunction', lambda p: False)(current):
             raise ValueError('Archive directories must not be symbolic links')
         if os.path.lexists(current):
             if not os.path.isdir(current):
@@ -78,6 +78,9 @@ else:
         result = {'root': root, 'path': target, 'part': part, 'ready': True}
     else:
         raise ValueError('Unknown archive operation')
+for key in ['root', 'path', 'part']:
+    if key in result:
+        result[key] = result[key].replace(os.sep, '/')
 print(json.dumps(result))
 `;
 

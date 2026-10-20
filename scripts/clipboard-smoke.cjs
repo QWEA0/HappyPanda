@@ -72,6 +72,7 @@ if(!process.versions.electron){
     await waitFor(()=>controller.snapshot().connection.phase==='connected');
     console.log('Isolated SSH shell connected');
     ipcMain.handle('hp:getState',()=>controller.snapshot());
+    ipcMain.handle('hp:remote:getState',()=>({enabled:false,addresses:[],devices:[],owner:{id:'desktop',name:'PC'}}));
     ipcMain.handle('hp:listSshAliases',()=>[]);
     ipcMain.handle('hp:pasteClipboard',async(event,request)=>{
       assert.equal(event.sender,window.webContents);calls++;

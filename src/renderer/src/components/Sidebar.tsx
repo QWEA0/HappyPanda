@@ -3,7 +3,7 @@ import {
   Activity, AlertTriangle, Clock3, Cpu, ExternalLink, FolderOpen, GitCompare, HardDrive,
   LogIn, MemoryStick, Pause, Play, RotateCw, Terminal, Trash2, Wrench, X, BookOpen,
 } from 'lucide-react';
-import type { ActivityEvent, AppState, ServiceNode, SessionInfo, SshAlias, SyncConflict } from '../../../shared/types';
+import type { ActivityEvent, AppState, ServiceNode, SessionInfo, SshAlias, SyncConflict, WorkspaceMode } from '../../../shared/types';
 import { connectionLabels, connectionTone, fileName, formatBytes, formatTime, formatUptime, nodeAddress, workspaceSyncLabel, workspaceSyncTone } from '../format';
 import type { RunAction } from '../useAppState';
 import { IconButton, Status, useFocusScope } from './ui';
@@ -48,9 +48,11 @@ export function Sidebar({ state, node, aliases, pending, run, narrow, modalOpen,
   const browserLogin = state.browserLogin?.nodeId === node.id ? state.browserLogin : undefined;
   const loginBusy = pending.has('new-session') || pending.has('select-provider');
   const workspace = state.workspaces.find((item) => item.id === state.connection.activeWorkspaceId && item.nodeId === node.id);
+  const mcpOnly=workspace?.mode==='mcp-only';
   const sync = isActive ? state.sync : null;
   const memoryUsed = metrics ? Math.max(0, metrics.memoryTotal - metrics.memoryAvailable) : 0;
   const memoryPercent = metrics && metrics.memoryTotal > 0 ? Math.min(100, Math.round(memoryUsed / metrics.memoryTotal * 100)) : null;
+  const open = new Set((state.openSessions ?? []).map((session) => session.sessionId));
   const sessions = state.sessions.filter((session) => session.nodeId === node.id).sort((a, b) => b.lastActiveAt.localeCompare(a.lastActiveAt)).slice(0, 12);
   const activities = state.activities.filter((event) => !event.workspaceId || !workspace || event.workspaceId === workspace.id)
     .sort((a, b) => b.time.localeCompare(a.time)).slice(0, 30);
@@ -106,17 +108,23 @@ export function Sidebar({ state, node, aliases, pending, run, narrow, modalOpen,
           {workspace ? <>
             <p className="workspace-name">{workspace.name}</p>
             <p className="workspace-path mono" title={workspace.localPath}>{workspace.localPath}</p>
-            <p className="remote-path muted mono" title={workspace.remotePath}>{workspace.remotePath}</p>
+            {!mcpOnly&&<p className="remote-path muted mono" title={workspace.remotePath}>{workspace.remotePath}</p>}
+            <div className="field workspace-mode-field"><label htmlFor="workspace-mode">工作区模式</label>
+              <select id="workspace-mode" value={workspace.mode??'sync'} disabled={pending.has('workspace-mode')||pending.has('connect')||pending.has('new-session')||pending.has('select-provider')||['preparing','connecting','retrying'].includes(phase)} aria-busy={pending.has('workspace-mode')}
+                onChange={event=>{void run('workspace-mode','切换工作区模式',api=>api.setWorkspaceMode(workspace.id,event.target.value as WorkspaceMode));}}>
+                <option value="mcp-only">仅本机 MCP</option><option value="sync">双向同步</option>
+              </select></div>
             {state.workspacePreparation?.workspaceId===workspace.id&&state.workspacePreparation.phase!=='ready'&&<p className={`sync-message ${state.workspacePreparation.phase==='error'?'danger-text':'muted'}`} role="status">{state.workspacePreparation.message}</p>}
-            <button className="button memory-import-button" disabled={!connected||pending.has('import-memory')} aria-busy={pending.has('import-memory')} onClick={()=>{
+            {!mcpOnly&&<button className="button memory-import-button" disabled={!connected||pending.has('import-memory')} aria-busy={pending.has('import-memory')} onClick={()=>{
               void run('import-memory','导入项目记忆',api=>api.importProjectMemory(workspace.id)).then(result=>{
                 if(result.ok)setMemoryResult({workspaceId:workspace.id,message:`已导入 ${result.value.imported} 份记忆，${result.value.unchanged} 份内容相同。新会话会自动读取，当前会话可重新读取 MEMORY.md。`,conflicts:result.value.conflicts});
               });
-            }}><BookOpen size={14} aria-hidden="true" />{pending.has('import-memory')?'正在导入记忆…':'导入本机项目记忆'}</button>
+            }}><BookOpen size={14} aria-hidden="true" />{pending.has('import-memory')?'正在导入记忆…':'导入本机项目记忆'}</button>}
             {memoryResult?.workspaceId===workspace.id&&<div className="memory-import-result" role="status"><p>{memoryResult.message}</p>{Boolean(memoryResult.conflicts.length)&&<p className="warning-text">以下文件与远端不同，已保留远端版本：{memoryResult.conflicts.join('、')}</p>}</div>}
             <div className="local-access-row"><span>本机 MCP</span><button type="button" className="switch" role="switch" aria-label="本机 MCP" aria-checked={workspace.localAccess}
-              title={workspace.localAccess ? '关闭本机 MCP' : '启用本机 MCP'} disabled={!connected || pending.has('local-access')}
+              title={mcpOnly?'仅本机 MCP 模式已开启本机访问':workspace.localAccess ? '关闭本机 MCP' : '启用本机 MCP'} disabled={mcpOnly||!connected || pending.has('local-access')||pending.has('workspace-mode')}
               onClick={() => { void run('local-access', '设置本机 MCP', (api) => api.setLocalAccess(workspace.id, !workspace.localAccess)); }}><span /></button></div>
+            {mcpOnly?<div className="sync-heading"><Status tone="neutral">仅本机 MCP</Status></div>:<>
             <div className="sync-heading"><Status tone={workspaceSyncTone(sync)} busy={['preparing', 'scanning', 'syncing'].includes(sync?.phase || '')||sync?.git?.phase==='syncing'}>{workspaceSyncLabel(sync)}</Status>
               <div className="section-tools"><IconButton icon={RotateCw} label="立即同步" disabled={!connected} busy={pending.has('sync-now')}
                 onClick={() => { void run('sync-now', '同步工作区', (api) => api.syncNow()); }} />
@@ -129,17 +137,18 @@ export function Sidebar({ state, node, aliases, pending, run, narrow, modalOpen,
             {Boolean(sync?.conflicts.length) && <ul className="conflict-list">{sync?.conflicts.map((conflict) => <li key={conflict.path}>
               <AlertTriangle size={14} className="warning-text" aria-hidden="true" /><span title={conflict.path}>{fileName(conflict.path)}</span>
               <IconButton icon={GitCompare} label={`处理 ${conflict.path} 的冲突`} onClick={() => onConflict(conflict)} disabled={!connected} /></li>)}</ul>}
+            </>}
           </> : <p className="empty-inline">尚未选择工作区</p>}
         </section>
         <section className="sidebar-section sessions-section"><div className="section-heading"><h2>最近会话</h2><span className="muted">{sessions.length}</span></div>
           {sessions.length ? <ul className="session-list">{sessions.map((session) => <li key={session.id} className="session-item">
-            <button className={`session-option ${session.id === state.connection.activeSessionId ? 'is-current' : ''}`} onClick={() => onResume(session)} disabled={pending.has('connect') || pending.has('new-session') || pending.has('select-provider')}
-              aria-current={session.id === state.connection.activeSessionId ? 'true' : undefined} title={`续接 ${session.title || session.id}`}>
+            <button className={`session-option ${session.id === state.connection.activeSessionId ? 'is-current' : ''}`} onClick={() => onResume(session)} disabled={(!open.has(session.id) && pending.has('connect')) || pending.has('new-session') || pending.has('select-provider')}
+              aria-current={session.id === state.connection.activeSessionId ? 'true' : undefined} title={open.has(session.id) ? `切换到 ${session.title || session.id}` : `续接 ${session.title || session.id}`}>
               {session.kind === 'login' ? <LogIn size={14} aria-hidden="true" /> : <Terminal size={14} aria-hidden="true" />}
-              <span className="option-text"><strong>{session.title || '未命名会话'}</strong><span className="muted">{formatTime(session.lastActiveAt, true)}{session.kind === 'login' ? ' · 登录' : session.kind === 'shell' ? ' · Shell' : ''}</span></span>
+              <span className="option-text"><strong>{session.title || '未命名会话'}</strong><span className="muted">{formatTime(session.lastActiveAt, true)}{session.kind === 'login' ? ' · 登录' : session.kind === 'shell' ? ' · Shell' : ''}{open.has(session.id) && session.id !== state.connection.activeSessionId ? ' · 运行中' : ''}</span></span>
               {session.id === state.connection.activeSessionId && <span className="current-session-dot" aria-label="当前会话" />}
             </button>
-            {session.id !== state.connection.activeSessionId && <IconButton icon={Trash2} label="删除会话" tooltip="删除会话并结束服务器上的 tmux 会话" className="session-remove"
+            {!open.has(session.id) && <IconButton icon={Trash2} label="删除会话" tooltip="删除会话并结束服务器上的 tmux 会话" className="session-remove"
               busy={pending.has('remove-session-' + session.id)}
               onClick={() => { void run('remove-session-' + session.id, '删除会话', (api) => api.removeSession(session.id)); }} />}
           </li>)}</ul> : <p className="empty-inline">暂无会话</p>}

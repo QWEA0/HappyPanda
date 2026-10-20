@@ -4,6 +4,7 @@ import { join, posix } from 'node:path';
 import type { Clipboard } from 'electron';
 import type { ServiceNode } from '../shared/types';
 import { runRemote, shellQuote } from './ssh';
+export { terminalPaste } from '../shared/terminal';
 
 export const MAX_CLIPBOARD_IMAGE_BYTES=20*1024*1024;
 const MAX_IMAGE_PIXELS=40_000_000;
@@ -42,13 +43,6 @@ export async function readClipboardContent(clipboard:Pick<Clipboard,'read'>):Pro
   return text?{kind:'text',text}:{kind:'empty'};
 }
 
-// Match xterm's newline/bracketed-paste behavior, with terminal control bytes removed
-// so clipboard content cannot terminate its own paste bracket or submit a control key.
-export function terminalPaste(text:string,bracketed:boolean):string {
-  const normalized=text.replace(/\r?\n/g,'\r').replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g,'');
-  return bracketed?'\x1b[200~'+normalized+'\x1b[201~':normalized;
-}
-
 export class ClipboardImageUploader {
   constructor(private resourcesDir:string,private remote:typeof runRemote=runRemote){}
   async upload(node:ServiceNode,sessionId:string,png:Buffer):Promise<string>{
@@ -60,7 +54,7 @@ export class ClipboardImageUploader {
     // Image bytes travel only through encrypted SSH stdin, never command arguments.
     const output=JSON.parse(await this.remote(node,command,png,90000));
     const suffix='/.local/share/happypanda/attachments/'+sessionKey+'/'+sha256+'.png';
-    if(typeof output.path!=='string'||!posix.isAbsolute(output.path)||posix.normalize(output.path)!==output.path||/[\x00-\x1f\x7f]/.test(output.path)||!output.path.endsWith(suffix)||output.sha256!==sha256||output.bytes!==png.length)throw new Error('图片上传校验失败，未写入终端。');
+    if(typeof output.path!=='string'||(!posix.isAbsolute(output.path)&&!/^[A-Za-z]:\//.test(output.path))||posix.normalize(output.path)!==output.path||/[\x00-\x1f\x7f]/.test(output.path)||!output.path.endsWith(suffix)||output.sha256!==sha256||output.bytes!==png.length)throw new Error('图片上传校验失败，未写入终端。');
     return output.path;
   }
 }

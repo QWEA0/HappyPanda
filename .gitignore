@@ -2,6 +2,7 @@ node_modules/
 out/
 release/
 .local/
+resources/windows-runtime.json.gz
 *.log
 .vite/
 
@@ -47,4 +48,5 @@ id_dsa*
 *.sqlite-shm
 /inventory.json
 /providers.json
+/remote-control.json
 bridge-key.bin

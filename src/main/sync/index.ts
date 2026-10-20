@@ -1,17 +1,19 @@
 import { randomUUID, createHash } from 'node:crypto';
-import { access, copyFile, lstat, mkdir, mkdtemp, realpath, rename, rm, unlink, writeFile } from 'node:fs/promises';
+import { copyFile, lstat, mkdir, mkdtemp, realpath, rename, rm, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import type { ActivityEvent, ServiceNode, SyncState, Workspace } from '../../shared/types';
 import { emptySync } from '../../shared/types';
 import { checkedLocalPath, conflictRelativePath, fileFingerprint, isWithin, sameFingerprint } from './paths';
 import { remoteFileOperation, type Fingerprint, type RunRemote } from './remote';
-import { JSON_TEMPLATE, normalizeMutagenState, parseMutagenSessions, type MutagenSession } from './state';
+import { normalizeMutagenState, parseMutagenSessions, type MutagenSession } from './state';
 import { gitIgnorePaths } from './git-ignores';
 import { timed } from '../perf';
+import { MutagenCli } from './mutagen';
 import { mutagenRemoteEndpoint, remoteRoot, runCommand, scpTransfer, sshAddress, verifySystemIdentity,
   type CommandRunner, type FileTransfer, type PrepareSsh, type SshPreparation } from './transport';
 
 export { normalizeMutagenState, parseMutagenSessions } from './state';
+export { MutagenCli } from './mutagen';
 export type { FileTransfer, PrepareSsh, SshPreparation } from './transport';
 
 export const SYNC_IGNORES = ['.git', 'node_modules', '.venv', 'venv', '__pycache__', '.pytest_cache', '.mypy_cache', '.ruff_cache', '.cache', '.happypanda-sync-*'];
@@ -29,6 +31,9 @@ export interface WorkspaceSyncOptions {
   pollIntervalMs?: number;
   /** Longest time an already-prepared session may be reused without recomputing Git ignore scope. */
   reuseMaxAgeMs?: number;
+  restartDaemonOnTransportChange?: boolean;
+  /** Shared daemon client. When supplied, disposal leaves stopping the daemon to its owner. */
+  cli?: MutagenCli;
   onWorkspaceUpdated?: (workspace:Workspace)=>Promise<void>;
 }
 
@@ -78,8 +83,8 @@ interface ActiveWorkspace {
 export class WorkspaceSync {
   private readonly options: WorkspaceSyncOptions;
   private readonly runner: CommandRunner;
-  private readonly mutagenDataDir: string;
-  private binary?: string;
+  private readonly mutagen: MutagenCli;
+  private readonly ownsCli: boolean;
   private active?: ActiveWorkspace;
   private state: SyncState = emptySync();
   private queue: Promise<unknown> = Promise.resolve();
@@ -89,7 +94,6 @@ export class WorkspaceSync {
   private disposed = false;
   private disposing = false;
   private disposal?: Promise<void>;
-  private started = false;
   private ensuredAt = 0;
   private lastActivity = 0;
   private idleTicks = 0;
@@ -99,7 +103,9 @@ export class WorkspaceSync {
   constructor(options: WorkspaceSyncOptions) {
     this.options = options;
     this.runner = options.runCommand ?? runCommand;
-    this.mutagenDataDir = path.resolve(options.dataDir, 'mutagen');
+    this.ownsCli = !options.cli;
+    this.mutagen = options.cli ?? new MutagenCli({ dataDir: options.dataDir, mutagenPath: options.mutagenPath, runCommand: options.runCommand,
+      restartDaemonOnTransportChange: options.restartDaemonOnTransportChange });
   }
 
   private serialize<T>(operation: () => Promise<T>): Promise<T> {
@@ -130,28 +136,17 @@ export class WorkspaceSync {
       sessionName: this.active?.workspace.syncSessionName, updatedAt: new Date().toISOString() });
   }
 
-  private async cli(args: string[], prepared?: SshPreparation): Promise<string> {
-    await mkdir(this.mutagenDataDir, { recursive: true });
-    if (!this.binary) {
-      const executable = process.platform === 'win32' ? 'mutagen.exe' : 'mutagen';
-      const candidate = path.resolve('.local', 'tools', executable);
-      try { await access(candidate); this.binary = this.options.mutagenPath ?? candidate; }
-      catch { this.binary = this.options.mutagenPath ?? executable; }
-    }
-    const env = { ...process.env, MUTAGEN_DATA_DIRECTORY: this.mutagenDataDir };
+  private cli(args: string[], prepared?: SshPreparation): Promise<string> {
+    return this.mutagen.run(args, prepared ?? this.active?.prepared);
+  }
+
+  private async sessions(prepared?: SshPreparation, shared = false): Promise<MutagenSession[]> {
     const connection = prepared ?? this.active?.prepared;
-    if (connection?.mutagenSshPath) Object.assign(env, { MUTAGEN_SSH_PATH: connection.mutagenSshPath });
-    this.started = true;
-    return timed('mutagen ' + args.slice(0, 2).join(' '), () => this.runner(this.binary!, args, { env, timeoutMs: args[1] === 'flush' ? 120_000 : 60_000 }));
+    return parseMutagenSessions(await (shared ? this.mutagen.pollList(connection) : this.mutagen.list(connection)));
   }
-
-  private async sessions(prepared?: SshPreparation): Promise<MutagenSession[]> {
-    return parseMutagenSessions(await this.cli(['sync', 'list', '--template', JSON_TEMPLATE], prepared));
-  }
-
-  private async readStatus(): Promise<SyncState> {
+  private async readStatus(shared = false): Promise<SyncState> {
     if (!this.active) return this.publish(emptySync());
-    const sessions = await this.sessions();
+    const sessions = await this.sessions(undefined, shared);
     const session = sessions.find(item => item.identifier === this.active!.identifier);
     if (!session) throw new Error('The workspace synchronization session no longer exists');
     assertReusableSession(session, this.active.localRoot, this.active.remotePath, this.active.connection, this.active.workspace.syncGitIgnores);
@@ -166,7 +161,8 @@ export class WorkspaceSync {
       // Settled and untouched: poll every 5th tick (10s) instead of spawning mutagen every 2s.
       if (adaptive && this.state.phase === 'ready' && Date.now() - this.lastActivity > 15_000 && ++this.idleTicks % 5 !== 0) return;
       this.polling = true;
-      void this.status().catch(() => undefined).finally(() => { this.polling = false; });
+      void this.serialize(async () => { try { return await this.readStatus(true); } catch (error) { return this.failed(error); } })
+        .catch(() => undefined).finally(() => { this.polling = false; });
     }, this.options.pollIntervalMs ?? 2000);
     this.timer.unref();
   }
@@ -180,7 +176,7 @@ export class WorkspaceSync {
         if (options.reuse && active && Date.now() - this.ensuredAt < (this.options.reuseMaxAgeMs ?? 10 * 60_000) &&
           active.workspace.id === workspace.id && active.workspace.localPath === workspace.localPath &&
           active.workspace.syncSessionName === workspace.syncSessionName && active.workspace.remotePath === workspace.remotePath &&
-          (['id', 'sshTarget', 'user', 'port', 'identityFile'] as const).every(key => active.node[key] === node[key])) {
+          (['id', 'sshTarget', 'user', 'port', 'identityFile', 'authType'] as const).every(key => active.node[key] === node[key])) {
           try {
             const session = (await this.sessions()).find(item => item.identifier === active.identifier);
             if (session) {
@@ -375,7 +371,7 @@ export class WorkspaceSync {
     this.disposal = this.queue.then(async () => {
       try {
         try { if (this.active) await this.cli(['sync', 'pause', this.active.identifier]); }
-        finally { if (this.started) await this.cli(['daemon', 'stop']); }
+        finally { if (this.ownsCli) await this.mutagen.stopDaemon(); }
       } finally { this.disposed = true; }
     });
     return this.disposal;

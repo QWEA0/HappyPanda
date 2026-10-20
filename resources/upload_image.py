@@ -67,7 +67,7 @@ def store_image(metadata, data, home=None):
                 verify_existing()
         finally:
             temporary.unlink(missing_ok=True)
-    return {"path": str(destination), "sha256": digest, "bytes": len(data)}
+    return {"path": destination.as_posix(), "sha256": digest, "bytes": len(data)}
 
 
 if __name__ == "__main__":

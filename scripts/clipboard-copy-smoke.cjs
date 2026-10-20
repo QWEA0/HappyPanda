@@ -91,6 +91,7 @@ if (!process.versions.electron) {
     originalClipboard = await Promise.all((await clipboard.read()).map(async item => new ClipboardItem(Object.fromEntries(await Promise.all(item.types.map(async type => [type, await item.getType(type)]))))));
     await clipboard.writeText(marker); clipboardOwned = true;
     ipcMain.handle('hp:getState', () => state);
+    ipcMain.handle('hp:remote:getState', () => ({ enabled: false, addresses: [], devices: [], owner: { id: 'desktop', name: 'PC' } }));
     ipcMain.handle('hp:listSshAliases', () => []);
     ipcMain.handle('hp:copyText', (event, text) => {
       assert.equal(event.sender, window.webContents);

@@ -6,6 +6,8 @@ import SSHConfig from 'ssh-config';
 import { existsSync, mkdirSync } from 'node:fs';
 import type { ServiceNode, SshAlias } from '../shared/types';
 import { timed } from './perf';
+import { authenticationArgs, sshEnvironment,sshTransportDirectory } from './ssh-auth';
+import { knownRemoteRuntime, setRemoteRuntime, runtimeKey, WINDOWS_PROBE, WINDOWS_EXECUTION, WINDOWS_STDIN_BOOTSTRAP, windowsPythonCommand, windowsOneShot, type RemoteRuntime } from './remote-platform';
 
 export const shellQuote = (value: string) => "'" + value.replace(/'/g, "'\"'\"'") + "'";
 export function sshExecutable(){
@@ -17,10 +19,10 @@ export function scpExecutable(){
   return existsSync(candidate)?candidate:'scp';
 }
 export function sshArgs(node: ServiceNode) {
-  const args = ['-o','BatchMode=yes','-o','ConnectTimeout=12','-o','StrictHostKeyChecking=yes','-o','ServerAliveInterval=10','-o','ServerAliveCountMax=3'];
+  const args = [...authenticationArgs(node),'-o','ConnectTimeout=12','-o','StrictHostKeyChecking=yes','-o','ServerAliveInterval=10','-o','ServerAliveCountMax=3'];
   if (node.user) args.push('-l',node.user);
   if (node.port) args.push('-p',String(node.port));
-  if (node.identityFile) args.push('-i',node.identityFile);
+  if (node.identityFile && node.authType !== 'password') args.push('-i',node.identityFile);
   return args;
 }
 // One-shot commands (remote helpers, git, scp) share a persistent SSH connection.
@@ -38,12 +40,12 @@ export function muxArgs():string[] {
   }
   return muxPath?['-o','ControlMaster=auto','-o','ControlPath='+muxPath,'-o','ControlPersist=120']:[];
 }
-export function runProcess(executable: string, args: string[], input?: string|Buffer, timeoutMs=45000): Promise<string> {
+export function runProcess(executable: string, args: string[], input?: string|Buffer, timeoutMs=45000, env?: NodeJS.ProcessEnv): Promise<string> {
   return new Promise((resolve,reject)=>{
-    const child=spawn(executable,args,{windowsHide:true,stdio:['pipe','pipe','pipe']});
+    const child=spawn(executable,args,{windowsHide:true,stdio:['pipe','pipe','pipe'],env});
     let stdout='',stderr='',settled=false;
     const finish=(error?:Error)=>{ if(settled)return; settled=true; clearTimeout(timer); if(error)reject(error);else resolve(stdout); };
-    const timer=setTimeout(()=>{child.kill();finish(new Error(executable+' timed out'));},timeoutMs);
+    const timer=setTimeout(()=>{child.kill();finish(new Error(executable+' timed out'+(stderr ? ': '+stderr.trim() : '')));},timeoutMs);
     child.stdout.on('data',data=>{stdout+=data.toString();if(stdout.length>8*1024*1024){child.kill();finish(new Error('Command output exceeded limit'));}});
     child.stderr.on('data',data=>{stderr=(stderr+data.toString()).slice(-16384);});
     child.on('error',error=>finish(error));
@@ -61,6 +63,7 @@ export const CHANNEL_SERVER = String.raw`
 import sys, os, json, base64, subprocess, threading
 lock = threading.Lock()
 shell = os.environ.get("SHELL") or "/bin/sh"
+${WINDOWS_EXECUTION}
 def reply(value):
     data = (json.dumps(value) + "\n").encode()
     with lock:
@@ -69,8 +72,8 @@ def reply(value):
 def handle(request):
     ident = request.get("id")
     try:
-        done = subprocess.run([shell, "-c", request["command"]], input=base64.b64decode(request.get("input") or ""),
-                              capture_output=True)
+        data = base64.b64decode(request.get("input") or "")
+        done = execute_windows(request['command'], data) if os.name == 'nt' else subprocess.run([shell, "-c", request["command"]], input=data, capture_output=True)
         reply({"id": ident, "code": done.returncode, "stdout": base64.b64encode(done.stdout).decode(),
                "stderr": base64.b64encode(done.stderr[-16384:]).decode()})
     except Exception as error:
@@ -117,10 +120,11 @@ export class SshChannel {
         }
       });
       child.stdin!.on('error', () => {});
-      child.stderr?.on('data', () => {});
+      let stderr = '';
+      child.stderr?.on('data', data => {stderr=(stderr+data.toString()).slice(-16384);});
       const ended = (error?: Error) => {
         this.dead = true; clearTimeout(timer);
-        if (!isReady) reject(error ?? new Error('SSH channel closed before it was ready'));
+        if (!isReady) reject(error ?? new Error(stderr.trim() || 'SSH channel closed before it was ready'));
         for (const entry of this.pending.values()) { clearTimeout(entry.timer); entry.reject(new Error('SSH connection closed')); }
         this.pending.clear();
       };
@@ -148,14 +152,50 @@ export class SshChannel {
 }
 
 const channels = new Map<string, SshChannel>();
-const channelKey = (node: ServiceNode) => [node.sshTarget, node.user ?? '', node.port ?? '', node.identityFile ?? ''].join('|');
+const probes = new Map<string,Promise<RemoteRuntime>>();
+export async function prepareRemoteRuntime(node:ServiceNode):Promise<RemoteRuntime> {
+  const known = knownRemoteRuntime(node); if (known) return known;
+  const key=runtimeKey(node);const pending=probes.get(key);if(pending)return pending;
+  const probe=(async()=>{
+    const execute=(command:string)=>runProcess(sshExecutable(),[...sshArgs(node),node.sshTarget,...command.split(' ')],undefined,25000,sshEnvironment(node));
+    const os=(await execute('echo %OS%')).trim();
+    let runtime:RemoteRuntime;
+    if(os==='Windows_NT')runtime=JSON.parse((await execute(WINDOWS_PROBE)).trim());
+    else {
+      try{runtime=JSON.parse((await execute(WINDOWS_PROBE)).trim());}
+      catch(error){
+        const message=String(error);
+        if(/HappyPanda:|Permission denied|Host key verification failed|timed out|Could not resolve|Connection/.test(message)||!/(powershell\.exe.*(?:not found|not recognized)|(?:not found|not recognized).*powershell\.exe)/i.test(message))throw error;
+        runtime={platform:'posix'};
+      }
+    }
+    if(runtime.platform==='windows'&&(!runtime.python||!runtime.node||!runtime.home))throw new Error('Invalid Windows runtime probe');
+    setRemoteRuntime(node,runtime);return runtime;
+  })().finally(()=>probes.delete(key));
+  probes.set(key,probe);return probe;
+}
+export async function remoteLaunchCommand(node:ServiceNode,helperPath:string,configPath:string):Promise<string> {
+  const runtime=await prepareRemoteRuntime(node);
+  return runtime.platform==='windows'?windowsPythonCommand(runtime,'import runpy,sys;sys.argv='+JSON.stringify([helperPath,'launch',configPath])+';runpy.run_path(sys.argv[0],run_name="__main__")'):
+    'python3 '+shellQuote(helperPath)+' launch '+shellQuote(configPath);
+}
+export function remoteCommandArguments(node:ServiceNode,command:string):string[] {
+  return knownRemoteRuntime(node)?.platform==='windows'&&command.startsWith('powershell.exe ')?command.split(' '):[command];
+}
+const channelKey = (node: ServiceNode) => [node.id, node.sshTarget, node.user ?? '', node.port ?? '', node.identityFile ?? '', node.authType ?? 'key'].join('|');
 function channelFor(node: ServiceNode): SshChannel {
   const key = channelKey(node);
   let channel = channels.get(key);
   if (!channel || !channel.usable) {
     const script = 'import base64;exec(base64.b64decode(' + JSON.stringify(Buffer.from(CHANNEL_SERVER).toString('base64')) + '))';
-    channel = new SshChannel(() => spawn(sshExecutable(), [...sshArgs(node), node.sshTarget, 'python3 -u -c ' + shellQuote(script)],
-      { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] }));
+    const runtime=knownRemoteRuntime(node);
+    const command=runtime?.platform==='windows'?windowsPythonCommand(runtime,WINDOWS_STDIN_BOOTSTRAP):'python3 -u -c ' + shellQuote(script);
+    channel = new SshChannel(() => {
+      const child=spawn(sshExecutable(), [...sshArgs(node), node.sshTarget, ...remoteCommandArguments(node,command)],
+        { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], env:sshEnvironment(node) });
+      if(runtime?.platform==='windows')child.stdin.write(Buffer.from(CHANNEL_SERVER).toString('base64')+'\n');
+      return child;
+    });
     channels.set(key, channel);
   }
   return channel;
@@ -167,32 +207,38 @@ export function closeSshChannels() {
 const channelDisabled = () => process.env.HAPPYPANDA_SSH_CHANNEL === '0';
 
 async function remoteCommand(node: ServiceNode, command: string, input?: string | Buffer, timeoutMs = 45000): Promise<string> {
+  const runtime=await prepareRemoteRuntime(node);
   if (!channelDisabled()) {
     const channel = channelFor(node);
     try { return await channel.run(command, input, timeoutMs); }
     catch (error) {
       // Only a channel that never became usable falls back; a command that ran and
       // failed (or a dropped connection mid-command) must not be executed twice.
-      if (channel.usable || (error as Error).message === 'SSH connection closed' || (error as Error).message === 'ssh timed out') throw error;
+      if (channel.usable || /Permission denied|Host key verification failed|REMOTE HOST IDENTIFICATION HAS CHANGED|Bad configuration/.test((error as Error).message) || (error as Error).message === 'SSH connection closed' || (error as Error).message === 'ssh timed out') throw error;
       channels.delete(channelKey(node));
     }
   }
-  return runProcess(sshExecutable(), [...sshArgs(node), ...muxArgs(), node.sshTarget, command], input, timeoutMs);
+  const fallback=runtime.platform==='windows'?windowsOneShot(runtime,command):undefined;
+  const payload=fallback?Buffer.concat([fallback.prefix,input===undefined?Buffer.alloc(0):Buffer.from(input)]):input;
+  return runProcess(sshExecutable(), [...sshArgs(node), ...muxArgs(), node.sshTarget, ...remoteCommandArguments(node,fallback?.command??command)], payload, timeoutMs, sshEnvironment(node));
 }
 export const runRemote = (node:ServiceNode,command:string,input?:string|Buffer,timeoutMs=45000) => timed('ssh '+command.slice(0,48).replace(/\s+/g,' '),()=>remoteCommand(node,command,input,timeoutMs));
 export async function uploadFile(node:ServiceNode,localPath:string,remotePath:string,timeoutMs=180000) {
-  const args=['-q','-o','BatchMode=yes','-o','ConnectTimeout=12','-o','StrictHostKeyChecking=yes',...muxArgs()];
+  const args=['-q',...authenticationArgs(node),'-o','ConnectTimeout=12','-o','StrictHostKeyChecking=yes',...muxArgs()];
+  const transport=sshTransportDirectory(node);if(knownRemoteRuntime(node)?.platform==='windows'&&transport)args.push('-S',join(transport,process.platform==='win32'?'ssh.exe':'ssh'));
   if(node.port)args.push('-P',String(node.port));
-  if(node.identityFile)args.push('-i',node.identityFile);
-  const target=(node.user?node.user+'@':'')+node.sshTarget;
-  await runProcess(scpExecutable(),[...args,localPath,target+':'+remotePath],undefined,timeoutMs);
+  if(node.identityFile && node.authType !== 'password')args.push('-i',node.identityFile);
+  const target=(node.user?node.user+'@':'')+node.sshTarget.split('@').at(-1);
+  const destination=node.user?target:node.sshTarget;
+  await runProcess(scpExecutable(),[...args,localPath,destination+':'+remotePath],undefined,timeoutMs,sshEnvironment(node));
 }
 export async function downloadFile(node:ServiceNode,localPath:string,remotePath:string) {
-  const args=['-q','-o','BatchMode=yes','-o','ConnectTimeout=12','-o','StrictHostKeyChecking=yes',...muxArgs()];
+  const args=['-q',...authenticationArgs(node),'-o','ConnectTimeout=12','-o','StrictHostKeyChecking=yes',...muxArgs()];
+  const transport=sshTransportDirectory(node);if(knownRemoteRuntime(node)?.platform==='windows'&&transport)args.push('-S',join(transport,process.platform==='win32'?'ssh.exe':'ssh'));
   if(node.port)args.push('-P',String(node.port));
-  if(node.identityFile)args.push('-i',node.identityFile);
-  const target=(node.user?node.user+'@':'')+node.sshTarget;
-  await runProcess(scpExecutable(),[...args,target+':'+remotePath,localPath],undefined,180000);
+  if(node.identityFile && node.authType !== 'password')args.push('-i',node.identityFile);
+  const target=node.user?node.user+'@'+node.sshTarget.split('@').at(-1):node.sshTarget;
+  await runProcess(scpExecutable(),[...args,target+':'+remotePath,localPath],undefined,180000,sshEnvironment(node));
 }
 export async function listSshAliases():Promise<SshAlias[]> {
   try {
@@ -209,6 +255,6 @@ export async function listSshAliases():Promise<SshAlias[]> {
 }
 export async function remoteHome(node:ServiceNode) {
   const home=(await runRemote(node,'printf "%s" "$HOME"')).trim();
-  if(!home.startsWith('/')||/[\r\n\0]/.test(home))throw new Error('Unsupported remote home path');
+  if((!home.startsWith('/')&&!/^[A-Za-z]:\//.test(home))||/[\r\n\0]/.test(home))throw new Error('Unsupported remote home path');
   return home;
 }

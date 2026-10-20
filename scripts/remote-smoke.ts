@@ -43,7 +43,7 @@ try{
   await waitFor(()=>controller.snapshot().workspacePreparation?.phase==='ready');
   assert.equal((await runRemote(node,'cat '+shellQuote(workspace.remotePath+'/hello.txt'))).trim(),'happypanda-local-before');checks.localToRemote=true;
   await runRemote(node,'printf "happypanda-remote-after\\n" > '+shellQuote(workspace.remotePath+'/hello.txt'));
-  assert.equal((await controller.sync.flush()).phase,'ready');assert.equal((await readFile(join(project,'hello.txt'),'utf8')).trim(),'happypanda-remote-after');checks.remoteToLocal=true;
+  assert.equal((await controller.workspaceSync(workspace.id).flush()).phase,'ready');assert.equal((await readFile(join(project,'hello.txt'),'utf8')).trim(),'happypanda-remote-after');checks.remoteToLocal=true;
   const localResults=await mcpSmoke(workspace.id);assert(localResults.read&&localResults.exec&&localResults.output&&localResults.idempotent);checks.remoteMcpRead=true;checks.remoteMcpExec=true;checks.realCommandOutput=true;checks.operationDeduplication=true;
   const forward=await controller.addPortForward(22);
   const banner=await new Promise<string>((resolve,reject)=>{const socket=createConnection({host:'127.0.0.1',port:forward.localPort});let text='';const timeout=setTimeout(()=>{socket.destroy();reject(new Error('Forwarded SSH banner timed out'));},10000);socket.on('data',chunk=>{text+=chunk.toString();if(text.includes('SSH-2.0')){clearTimeout(timeout);socket.destroy();resolve(text);}});socket.once('error',error=>{clearTimeout(timeout);reject(error);});});

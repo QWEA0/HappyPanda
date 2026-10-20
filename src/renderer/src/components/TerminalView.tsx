@@ -3,32 +3,53 @@ import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 import { AlertTriangle, LoaderCircle, Terminal as TerminalIcon } from 'lucide-react';
-import type { AppState } from '../../../shared/types';
+import type { AppEvent, AppState, OpenSessionState } from '../../../shared/types';
 import { errorText, requireDesktop } from '../api';
 import { connectionLabels } from '../format';
+import { terminalPaste } from '../../../shared/terminal';
+import { terminalDisplayScale } from '../remote-terminal-tools';
 
 export interface TerminalHandle {
   copy(): Promise<void>;
   paste(): Promise<void>;
   focus(): void;
+  sendText(text: string): Promise<void>;
+  bracketedPaste(): boolean;
 }
 
 interface TerminalProps {
   state: AppState;
   onError: (title: string, detail: string) => void;
   onInfo: (title: string) => void;
+  inputEnabled?: boolean;
+  mobile?: boolean;
+  fontSize?: number;
+  fitToViewport?: boolean;
+  onImage?: (file: File) => Promise<void>;
+  /** Bind the view to one open session (desktop tabs). Without it the view follows the focused session. */
+  session?: OpenSessionState;
+  /** A bound view that is not active stays mounted but hidden; xterm keeps parsing output without rendering it. */
+  active?: boolean;
 }
 
 function contextId(state: AppState): string {
   return `${state.connection.activeNodeId || ''}/${state.connection.activeSessionId || ''}`;
 }
+function target(props: TerminalProps) {
+  if (props.session) return { nodeId: props.session.nodeId, sessionId: props.session.sessionId, phase: props.session.phase, message: props.session.message };
+  const { activeNodeId, activeSessionId, phase, message } = props.state.connection;
+  return { nodeId: activeNodeId, sessionId: activeSessionId, phase, message };
+}
+const targetContext = (props: TerminalProps) => { const { nodeId, sessionId } = target(props); return `${nodeId || ''}/${sessionId || ''}`; };
 
 export const TerminalView = forwardRef<TerminalHandle, TerminalProps>(function TerminalView(props, ref) {
+  const viewportRef = useRef<HTMLDivElement>(null);
   const hostRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
+  const fitRef = useRef<(() => void) | null>(null);
   const propsRef = useRef(props);
   propsRef.current = props;
-  const [hasOutput, setHasOutput] = useState(Boolean(props.state.terminalBuffer));
+  const [hasOutput, setHasOutput] = useState(Boolean(!props.session && props.state.terminalBuffer));
   const [pastingContext,setPastingContext]=useState<string|null>(null);
   const pasteRef=useRef<{context:string}|null>(null);
 
@@ -43,19 +64,19 @@ export const TerminalView = forwardRef<TerminalHandle, TerminalProps>(function T
   }, []);
 
   const paste = useCallback(async () => {
-    const state=propsRef.current.state;
-    const context=contextId(state);
+    const current=target(propsRef.current);
+    const context=targetContext(propsRef.current);
     if(pasteRef.current?.context===context)return;
     const operation={context};pasteRef.current=operation;
     try {
       const api=requireDesktop();
       const terminal=terminalRef.current;
-      if (!terminal||state.connection.phase !== 'connected'||!state.connection.activeNodeId||!state.connection.activeSessionId) {
+      if (!terminal||current.phase !== 'connected'||!current.nodeId||!current.sessionId) {
         throw new Error('终端尚未连接，暂时无法粘贴。');
       }
       setPastingContext(context);
-      const result=await api.pasteClipboard({nodeId:state.connection.activeNodeId,sessionId:state.connection.activeSessionId,bracketedPaste:terminal.modes.bracketedPasteMode});
-      if(terminalRef.current===terminal&&contextId(propsRef.current.state)===context){
+      const result=await api.pasteClipboard({nodeId:current.nodeId,sessionId:current.sessionId,bracketedPaste:terminal.modes.bracketedPasteMode});
+      if(terminalRef.current===terminal&&targetContext(propsRef.current)===context){
         terminal.focus();
         if(result.kind==='image')propsRef.current.onInfo('图片已粘贴，可以补充说明后按 Enter 发送。');
         else if(result.kind==='empty')propsRef.current.onInfo('剪贴板里没有图片或文字。');
@@ -65,13 +86,23 @@ export const TerminalView = forwardRef<TerminalHandle, TerminalProps>(function T
     } finally {if(pasteRef.current===operation){pasteRef.current=null;setPastingContext(null);}}
   }, []);
 
-  useImperativeHandle(ref, () => ({ copy, paste, focus: () => terminalRef.current?.focus() }), [copy, paste]);
+  useImperativeHandle(ref, () => ({
+    copy, paste, focus: () => { if (!propsRef.current.mobile) terminalRef.current?.focus(); },
+    bracketedPaste: () => Boolean(terminalRef.current?.modes.bracketedPasteMode),
+    sendText: async text => {
+      if (!terminalRef.current || propsRef.current.inputEnabled === false || target(propsRef.current).phase !== 'connected') throw new Error('终端尚未连接或未取得控制权。');
+      await requireDesktop().writeTerminal(terminalPaste(text, terminalRef.current.modes.bracketedPasteMode) + '\r', propsRef.current.session?.sessionId);
+    },
+  }), [copy, paste]);
 
   useEffect(() => {
     if (!hostRef.current) return;
+    const bound = propsRef.current.session?.sessionId;
     const terminal = new Terminal({
+      cols: propsRef.current.state.terminalSize?.cols ?? 100,
+      rows: propsRef.current.state.terminalSize?.rows ?? 32,
       fontFamily: '"Cascadia Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace',
-      fontSize: 14,
+      fontSize: propsRef.current.fontSize ?? 14,
       fontWeight: 'normal',
       fontWeightBold: 'bold',
       lineHeight: 1.2,
@@ -81,7 +112,7 @@ export const TerminalView = forwardRef<TerminalHandle, TerminalProps>(function T
       scrollback: 10000,
       screenReaderMode: true,
       rightClickSelectsWord: true,
-      disableStdin: !window.happyPanda || propsRef.current.state.connection.phase !== 'connected',
+      disableStdin: !window.happyPanda || target(propsRef.current).phase !== 'connected' || propsRef.current.inputEnabled === false,
       theme: {
         background: '#191B1E',
         foreground: '#E5E7EB',
@@ -106,30 +137,93 @@ export const TerminalView = forwardRef<TerminalHandle, TerminalProps>(function T
     terminal.open(hostRef.current);
     terminalRef.current = terminal;
     let currentContext = contextId(propsRef.current.state);
-    let outputReceived = Boolean(propsRef.current.state.terminalBuffer);
-    if (propsRef.current.state.terminalBuffer) terminal.write(propsRef.current.state.terminalBuffer);
+    let outputReceived = false;
     let disposed = false;
     let frame = 0;
+    const received = (data: string) => {
+      terminal.write(data);
+      if (data && !outputReceived) { outputReceived = true; setHasOutput(true); }
+    };
+    // A bound view tracks the PTY generation (a reattach starts a new terminal) and the
+    // output offset, so scrollback fetched on mount splices exactly with streamed events.
+    let generation = -1;
+    let end = 0;
+    let queued: Extract<AppEvent, { type: 'terminal' }>[] | null = bound ? [] : null;
+    const restart = (next: number) => {
+      generation = next; end = 0; terminal.reset();
+      outputReceived = false; setHasOutput(false);
+    };
+    const boundOutput = (event: Extract<AppEvent, { type: 'terminal' }>) => {
+      if (event.generation !== undefined && event.generation !== generation) {
+        if (event.generation < generation) return;
+        restart(event.generation);
+      }
+      const eventEnd = event.end ?? end + event.data.length;
+      if (eventEnd <= end) return;
+      const skip = Math.max(0, end - (eventEnd - event.data.length));
+      end = eventEnd;
+      received(skip ? event.data.slice(skip) : event.data);
+    };
+    if (bound) {
+      void requireDesktop().getTerminalBuffer(bound).then(buffer => {
+        if (disposed) return;
+        const pending = queued ?? [];
+        queued = null;
+        generation = buffer.generation; end = buffer.end;
+        if (buffer.data) received(buffer.data);
+        for (const event of pending) boundOutput(event);
+      }).catch(error => {
+        const pending = queued ?? [];
+        queued = null;
+        for (const event of pending) boundOutput(event);
+        propsRef.current.onError('读取终端历史失败', errorText(error));
+      });
+    } else if (propsRef.current.state.terminalBuffer) received(propsRef.current.state.terminalBuffer);
 
     const scheduleFit = () => {
       window.cancelAnimationFrame(frame);
       frame = window.requestAnimationFrame(() => {
         if (disposed || !hostRef.current || hostRef.current.clientWidth < 1 || hostRef.current.clientHeight < 1) return;
-        try { fit.fit(); } catch (error) { propsRef.current.onError('终端尺寸更新失败', errorText(error)); }
+        try {
+          const host = hostRef.current;
+          const viewport = viewportRef.current;
+          host.style.width = '';
+          host.style.height = '';
+          host.style.transform = '';
+          host.dataset.terminalScale = '1';
+          const size = propsRef.current.state.terminalSize;
+          if (propsRef.current.inputEnabled === false && size) {
+            terminal.resize(size.cols, size.rows);
+          }
+          else {
+            const size = fit.proposeDimensions();
+            // Keep short keyboard viewports within the PTY's accepted dimensions.
+            if (size) terminal.resize(Math.max(10, Math.min(500, size.cols)), Math.max(3, Math.min(300, size.rows)));
+          }
+          const screen = terminal.element?.querySelector<HTMLElement>('.xterm-screen');
+          if (propsRef.current.fitToViewport && viewport && screen) {
+            const scale = terminalDisplayScale({ width: viewport.clientWidth, height: viewport.clientHeight }, { width: screen.offsetWidth, height: screen.offsetHeight });
+            host.style.width = `${viewport.clientWidth / scale}px`;
+            host.style.height = `${viewport.clientHeight / scale}px`;
+            host.style.transform = `scale(${scale})`;
+            host.dataset.terminalScale = String(scale);
+          }
+        } catch (error) { propsRef.current.onError('终端尺寸更新失败', errorText(error)); }
       });
     };
+    fitRef.current = scheduleFit;
     const observer = new ResizeObserver(scheduleFit);
-    observer.observe(hostRef.current);
+    observer.observe(viewportRef.current ?? hostRef.current);
     scheduleFit();
     void document.fonts.ready.then(() => { if (!disposed) scheduleFit(); });
 
     const input = terminal.onData((data) => {
-      try { requireDesktop().writeTerminal(data); }
+      try { void Promise.resolve(requireDesktop().writeTerminal(data, bound)).catch(error => propsRef.current.onError('终端输入失败', errorText(error))); }
       catch (error) { propsRef.current.onError('终端输入失败', errorText(error)); }
     });
     const resize = terminal.onResize(({ cols, rows }) => {
-      if (!window.happyPanda) return;
-      try { window.happyPanda.resizeTerminal(cols, rows); }
+      if (!window.happyPanda || propsRef.current.inputEnabled === false || (bound && !propsRef.current.active)) return;
+      try { void Promise.resolve(window.happyPanda.resizeTerminal(cols, rows, bound)).catch(error => propsRef.current.onError('调整远程终端失败', errorText(error))); }
       catch (error) { propsRef.current.onError('调整远程终端失败', errorText(error)); }
     });
     terminal.attachCustomKeyEventHandler((event) => {
@@ -145,40 +239,64 @@ export const TerminalView = forwardRef<TerminalHandle, TerminalProps>(function T
         if(!event.repeat)void paste();
         return false;
       }
+      // Ctrl+Tab switches session tabs (handled by the app); keep it out of the PTY.
+      if (event.ctrlKey && event.key === 'Tab') return false;
       return true;
     });
     // Catch native/context-menu paste before xterm's text-only handler.
     const host=hostRef.current;
-    const pasteEvent=(event:ClipboardEvent)=>{event.preventDefault();event.stopImmediatePropagation();void paste();};
+    const pasteEvent=(event:ClipboardEvent)=>{
+      event.preventDefault();event.stopImmediatePropagation();
+      if(propsRef.current.mobile&&event.clipboardData){
+        const image=Array.from(event.clipboardData.files).find(file=>file.type.startsWith('image/'));
+        const text=event.clipboardData.getData('text/plain');
+        if(image&&propsRef.current.onImage){void propsRef.current.onImage(image).catch(error=>propsRef.current.onError('图片上传失败',errorText(error)));return;}
+        if(text){
+          try{void Promise.resolve(requireDesktop().writeTerminal(terminalPaste(text,terminal.modes.bracketedPasteMode),bound)).catch(error=>propsRef.current.onError('粘贴失败',errorText(error)));}
+          catch(error){propsRef.current.onError('粘贴失败',errorText(error));}
+          return;
+        }
+      }
+      void paste();
+    };
     host.addEventListener('paste',pasteEvent,true);
 
     let unsubscribe: (() => void) | undefined;
     try {
       unsubscribe = window.happyPanda?.onEvent((event) => {
         if (disposed) return;
+        if (bound) {
+          if (event.type === 'terminal' && event.sessionId === bound) {
+            if (queued) queued.push(event); else boundOutput(event);
+          } else if (event.type === 'state' && !queued) {
+            const next = event.state.openSessions?.find(item => item.sessionId === bound)?.generation;
+            if (next !== undefined && next > generation) restart(next);
+          }
+          return;
+        }
         if (event.type === 'terminal') {
-          terminal.write(event.data);
-          if (event.data && !outputReceived) { outputReceived = true; setHasOutput(true); }
+          received(event.data);
+        } else if (event.type === 'terminal-size') {
+          if (propsRef.current.inputEnabled === false) terminal.resize(event.cols, event.rows);
         } else if (event.type === 'state') {
           const nextContext = contextId(event.state);
-          if (nextContext !== currentContext) {
+          if (nextContext !== currentContext || event.resetTerminal) {
             currentContext = nextContext;
             terminal.reset();
+            if (propsRef.current.inputEnabled === false && event.state.terminalSize) terminal.resize(event.state.terminalSize.cols, event.state.terminalSize.rows);
             outputReceived = Boolean(event.state.terminalBuffer);
             setHasOutput(outputReceived);
             if (event.state.terminalBuffer) terminal.write(event.state.terminalBuffer);
             scheduleFit();
           } else if (!outputReceived && event.state.terminalBuffer) {
-            terminal.write(event.state.terminalBuffer);
-            outputReceived = true;
-            setHasOutput(true);
+            received(event.state.terminalBuffer);
           }
         }
       });
     } catch (error) {
       propsRef.current.onError('订阅终端输出失败', errorText(error));
     }
-    terminal.focus();
+    if (!propsRef.current.mobile && (!bound || propsRef.current.active)) terminal.focus();
     return () => {
       disposed = true;
       window.cancelAnimationFrame(frame);
@@ -189,26 +307,39 @@ export const TerminalView = forwardRef<TerminalHandle, TerminalProps>(function T
       resize.dispose();
       terminal.dispose();
       terminalRef.current = null;
+      fitRef.current = null;
     };
   }, [copy, paste]);
 
+  const phase = target(props).phase;
   useEffect(() => {
     if (terminalRef.current) {
-      terminalRef.current.options.disableStdin = !window.happyPanda || props.state.connection.phase !== 'connected';
+      terminalRef.current.options.disableStdin = !window.happyPanda || phase !== 'connected' || props.inputEnabled === false;
+      terminalRef.current.options.fontSize = props.fontSize ?? 14;
+      fitRef.current?.();
     }
-  }, [props.state.connection.phase]);
+  }, [phase, props.inputEnabled, props.state.terminalSize?.cols, props.state.terminalSize?.rows, props.fontSize, props.fitToViewport]);
 
-  const phase = props.state.connection.phase;
+  // Becoming the visible tab: size the PTY to the shared container and take keyboard focus.
+  useEffect(() => {
+    if (!props.session || !props.active) return;
+    fitRef.current?.();
+    if (!props.mobile) terminalRef.current?.focus();
+  }, [props.session?.sessionId, props.active, props.mobile]);
+
+  const message = target(props).message;
   const busy = ['preparing', 'connecting', 'retrying'].includes(phase);
   const showEmptyState = !hasOutput && phase !== 'connected';
-  return <div className="terminal-view">
-    <div ref={hostRef} className="terminal-host" aria-label="远程 SSH 终端" />
-    {pastingContext===contextId(props.state)&&<div className="terminal-paste-status" role="status"><LoaderCircle size={14} className="spin" aria-hidden="true" />正在粘贴…</div>}
+  return <div className={`terminal-view${props.inputEnabled === false && props.state.terminalSize ? ' terminal-view-observer' : ''}${props.fitToViewport ? ' terminal-view-fit' : ''}`}
+    hidden={props.session ? !props.active : undefined} role={props.session ? 'tabpanel' : undefined}
+    id={props.session ? `terminal-${props.session.sessionId}` : undefined}>
+    <div ref={viewportRef} className="terminal-viewport"><div ref={hostRef} className="terminal-host" aria-label="远程 SSH 终端" /></div>
+    {pastingContext===targetContext(props)&&<div className="terminal-paste-status" role="status"><LoaderCircle size={14} className="spin" aria-hidden="true" />正在粘贴…</div>}
     {showEmptyState && <div className="terminal-empty" role="status" aria-live="polite">
       {busy ? <LoaderCircle size={25} className="spin" aria-hidden="true" />
         : phase === 'failed' ? <AlertTriangle size={25} aria-hidden="true" /> : <TerminalIcon size={25} aria-hidden="true" />}
       <h2>{connectionLabels[phase]}</h2>
-      {props.state.connection.message && <p>{props.state.connection.message}</p>}
+      {message && <p>{message}</p>}
     </div>}
   </div>;
 });
